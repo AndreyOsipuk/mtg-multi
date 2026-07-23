@@ -5,7 +5,6 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"fmt"
 	"hash"
 	"io"
@@ -25,11 +24,26 @@ type Obfuscator struct {
 // validates it, and returns the DC the client requested along with a
 // transparent en/decrypting wrapper over r.
 func (o Obfuscator) ReadHandshake(r essentials.Conn) (int, essentials.Conn, error) {
-	frame := handshakeFrame{}
+	raw := handshakeFrame{}
 
-	if _, err := io.ReadFull(r, frame.data[:]); err != nil {
+	if _, err := io.ReadFull(r, raw.data[:]); err != nil {
 		return 0, nil, fmt.Errorf("cannot read frame: %w", err)
 	}
+
+	dc, cn, ok := o.tryFrame(raw, r)
+	if !ok {
+		return 0, nil, fmt.Errorf("unsupported connection type")
+	}
+
+	return dc, cn, nil
+}
+
+// tryFrame пытается разобрать УЖЕ прочитанный 64-байтный кадр `raw` ключом o.Secret.
+// Работает на КОПИИ (raw передаётся по значению) — можно пробовать несколько ключей
+// над одним кадром (multi-secret secured-режим). ok=false, если ключ не подошёл
+// (connectionType после дешифровки не совпал).
+func (o Obfuscator) tryFrame(raw handshakeFrame, r essentials.Conn) (int, essentials.Conn, bool) {
+	frame := raw // копия
 
 	hasher := sha256.New()
 	recvCipher := o.getCipher(&frame, hasher)
@@ -41,7 +55,7 @@ func (o Obfuscator) ReadHandshake(r essentials.Conn) (int, essentials.Conn, erro
 	recvCipher.XORKeyStream(frame.data[:], frame.data[:])
 
 	if val := frame.connectionType(); subtle.ConstantTimeCompare(val, hfConnectionType[:]) != 1 {
-		return 0, nil, fmt.Errorf("unsupported connection type: %s", hex.EncodeToString(val))
+		return 0, nil, false
 	}
 
 	cn := conn{
@@ -50,7 +64,33 @@ func (o Obfuscator) ReadHandshake(r essentials.Conn) (int, essentials.Conn, erro
 		sendCipher: sendCipher,
 	}
 
-	return frame.dc(), cn, nil
+	return frame.dc(), cn, true
+}
+
+// ReadHandshakeMulti читает 64-байтный obfuscated2-кадр ОДИН раз и перебирает
+// секреты: у чьего ключа connectionType сходится — тот и матч. Используется для
+// secured-режима (dd-секрет), где клиент шлёт obfuscated2 напрямую (без FakeTLS),
+// и мы не знаем заранее, какой это юзер. Возвращает индекс совпавшего секрета,
+// dc, обёрнутое соединение и КЛЮЧ КАДРА (32б) для anti-replay.
+func ReadHandshakeMulti(r essentials.Conn, secrets [][]byte) (int, int, essentials.Conn, []byte, error) {
+	raw := handshakeFrame{}
+
+	if _, err := io.ReadFull(r, raw.data[:]); err != nil {
+		return -1, 0, nil, nil, fmt.Errorf("cannot read frame: %w", err)
+	}
+
+	// Ключ кадра (случаен на каждый коннект) — для anti-replay ДО дешифровки.
+	replayKey := make([]byte, hfLenKey)
+	copy(replayKey, raw.key())
+
+	for i, secret := range secrets {
+		obf := Obfuscator{Secret: secret}
+		if dc, cn, ok := obf.tryFrame(raw, r); ok {
+			return i, dc, cn, replayKey, nil
+		}
+	}
+
+	return -1, 0, nil, nil, fmt.Errorf("no matching secret for secured handshake")
 }
 
 // SendHandshake writes a fresh 64-byte obfuscated2 handshake for the given

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -359,6 +360,12 @@ func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyc
 
 		ThrottleMaxConnections: conf.Throttle.MaxConnections.Get(0),
 		ThrottleCheckInterval:  conf.Throttle.CheckInterval.Get(5 * time.Second),
+
+		// Тёплый пул коннектов к DC включён по умолчанию; kill-switch через ENV
+		// (config.toml не трогаем — он генерится ботом). MTG_DC_POOL=off отключает,
+		// MTG_DC_POOL_SIZE=N задаёт число тёплых коннектов на DC.
+		DCPoolEnabled: !strings.EqualFold(os.Getenv("MTG_DC_POOL"), "off"),
+		DCPoolSize:    envUint("MTG_DC_POOL_SIZE"),
 	}
 
 	proxy, err := mtglib.NewProxy(opts)
@@ -407,4 +414,14 @@ func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyc
 	proxy.Shutdown()
 
 	return nil
+}
+
+// envUint парсит беззнаковое из ENV; пусто/мусор → 0 (вызывающий подставит дефолт).
+func envUint(name string) uint {
+	v, err := strconv.ParseUint(strings.TrimSpace(os.Getenv(name)), 10, 32)
+	if err != nil {
+		return 0
+	}
+
+	return uint(v)
 }

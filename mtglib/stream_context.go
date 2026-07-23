@@ -19,7 +19,12 @@ type streamContext struct {
 	dc               int
 	matchedSecretKey []byte
 	secretName       string
-	logger           Logger
+	// secured=true — клиент подключился через secured-режим (dd-секрет,
+	// obfuscated2 без FakeTLS-обёртки). В этом случае obfuscated2-рукопожатие уже
+	// сделано внутри doSecuredHandshake, и ServeConn пропускает FakeTLS-специфику
+	// (doppelganger + отдельный doObfuscatedHandshake).
+	secured bool
+	logger  Logger
 }
 
 func (s *streamContext) Deadline() (time.Time, bool) {

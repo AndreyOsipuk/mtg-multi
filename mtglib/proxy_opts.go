@@ -205,6 +205,23 @@ type ProxyOpts struct {
 	//
 	// This is an optional setting.
 	ThrottleCheckInterval time.Duration
+
+	// DCPoolEnabled turns ON the warm DC connection pool (dcPool): it keeps a few
+	// pre-established connections to each Telegram DC so a client connect does
+	// not pay the cold dial+handshake and does not trigger Telegram client
+	// backoff when the node→DC route flaps.
+	//
+	// Off by default at the library level (least surprise for embedders and
+	// tests); the mtg binary enables it by default via run_proxy.
+	//
+	// This is an optional setting.
+	DCPoolEnabled bool
+
+	// DCPoolSize is the number of warm connections kept per DC. Defaults to
+	// DefaultDCPoolSize.
+	//
+	// This is an optional setting.
+	DCPoolSize uint
 }
 
 func (p ProxyOpts) valid() error {
@@ -305,6 +322,14 @@ func (p ProxyOpts) getThrottleCheckInterval() time.Duration {
 	}
 
 	return p.ThrottleCheckInterval
+}
+
+func (p ProxyOpts) getDCPoolSize() int {
+	if p.DCPoolSize == 0 {
+		return DefaultDCPoolSize
+	}
+
+	return int(p.DCPoolSize)
 }
 
 func (p ProxyOpts) getLogger(name string) Logger {
