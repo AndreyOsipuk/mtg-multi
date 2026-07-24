@@ -109,7 +109,11 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	p.stats.OnConnect(ctx.secretName)
 	p.stats.UpdateLastSeen(ctx.secretName)
 
+	clientIP := ctx.ClientIP().String()
+	p.stats.OnConnectIP(ctx.secretName, clientIP)
+
 	defer p.stats.OnDisconnect(ctx.secretName)
+	defer p.stats.OnDisconnectIP(ctx.secretName, clientIP)
 
 	// FakeTLS-специфика: doppelganger-обёртка (калибровка TLS-шума) + отдельное
 	// obfuscated2-рукопожатие поверх распакованного TLS. Для secured (dd) это уже

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,9 @@ type secretStats struct {
 	bytesIn     atomic.Int64
 	bytesOut    atomic.Int64
 	lastSeen    atomic.Value // stores time.Time
+
+	ipsMu sync.Mutex
+	ips   map[string]int
 }
 
 // ProxyStats tracks per-secret connection stats with atomic counters.
@@ -78,6 +82,39 @@ func (s *ProxyStats) OnConnect(name string) {
 // OnDisconnect decrements the active connection count for the given secret.
 func (s *ProxyStats) OnDisconnect(name string) {
 	s.getOrCreate(name).connections.Add(-1)
+}
+
+// OnConnectIP registers an active client IP for a secret.
+func (s *ProxyStats) OnConnectIP(name, ip string) {
+	if ip == "" {
+		return
+	}
+
+	st := s.getOrCreate(name)
+	st.ipsMu.Lock()
+	defer st.ipsMu.Unlock()
+
+	if st.ips == nil {
+		st.ips = make(map[string]int)
+	}
+	st.ips[ip]++
+}
+
+// OnDisconnectIP unregisters an active client IP for a secret.
+func (s *ProxyStats) OnDisconnectIP(name, ip string) {
+	if ip == "" {
+		return
+	}
+
+	st := s.getOrCreate(name)
+	st.ipsMu.Lock()
+	defer st.ipsMu.Unlock()
+
+	if st.ips[ip] <= 1 {
+		delete(st.ips, ip)
+		return
+	}
+	st.ips[ip]--
 }
 
 // AddBytesIn adds to the bytes-in counter for the given secret.
@@ -235,6 +272,7 @@ type UserStatsJSON struct {
 	BytesIn     int64      `json:"bytes_in"`
 	BytesOut    int64      `json:"bytes_out"`
 	LastSeen    *time.Time `json:"last_seen"`
+	ActiveIPs   []string   `json:"active_ips"`
 }
 
 func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -255,11 +293,20 @@ func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lastSeenPtr = &lastSeen
 		}
 
+		st.ipsMu.Lock()
+		activeIPs := make([]string, 0, len(st.ips))
+		for ip := range st.ips {
+			activeIPs = append(activeIPs, ip)
+		}
+		st.ipsMu.Unlock()
+		sort.Strings(activeIPs)
+
 		users[name] = UserStatsJSON{
 			Connections: conns,
 			BytesIn:     st.bytesIn.Load(),
 			BytesOut:    st.bytesOut.Load(),
 			LastSeen:    lastSeenPtr,
+			ActiveIPs:   activeIPs,
 		}
 	}
 
