@@ -222,6 +222,45 @@ type ProxyOpts struct {
 	//
 	// This is an optional setting.
 	DCPoolSize uint
+
+	// DDShapeEnabled masks the first server-to-client response for secured
+	// connections with a random delay and fragmentation.
+	//
+	// This is an optional setting.
+	DDShapeEnabled bool
+
+	// DDShapeDelayMinMs and DDShapeDelayMaxMs bound the random delay before the
+	// first secured server-to-client write.
+	DDShapeDelayMinMs int
+	DDShapeDelayMaxMs int
+
+	// DDShapeFragBytes is the maximum fragment size for the first secured
+	// server-to-client write.
+	DDShapeFragBytes int
+}
+
+func (p ProxyOpts) getDDShapeDelayMinMs() int {
+	if p.DDShapeDelayMinMs == 0 {
+		return DefaultDDShapeDelayMinMs
+	}
+
+	return p.DDShapeDelayMinMs
+}
+
+func (p ProxyOpts) getDDShapeDelayMaxMs() int {
+	if p.DDShapeDelayMaxMs == 0 {
+		return DefaultDDShapeDelayMaxMs
+	}
+
+	return p.DDShapeDelayMaxMs
+}
+
+func (p ProxyOpts) getDDShapeFragBytes() int {
+	if p.DDShapeFragBytes == 0 {
+		return DefaultDDShapeFragBytes
+	}
+
+	return p.DDShapeFragBytes
 }
 
 func (p ProxyOpts) valid() error {

@@ -40,6 +40,11 @@ type Proxy struct {
 	doppelGanger                *doppel.Ganger
 	dcPool                      *dcPool
 
+	ddShapeEnabled    bool
+	ddShapeDelayMinMs int
+	ddShapeDelayMaxMs int
+	ddShapeFragBytes  int
+
 	stats           *ProxyStats
 	secrets         []Secret
 	secretNames     []string
@@ -142,6 +147,17 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	if err := p.doTelegramCall(ctx); err != nil {
 		ctx.logger.WarningError("cannot dial to telegram", err)
 		return
+	}
+
+	// Shape only the first secured server response. FakeTLS connections already
+	// have a TLS wrapper and keep their existing behavior.
+	if ctx.secured && p.ddShapeEnabled {
+		ctx.clientConn = newShapedClientConn(
+			ctx.clientConn,
+			p.ddShapeDelayMinMs,
+			p.ddShapeDelayMaxMs,
+			p.ddShapeFragBytes,
+		)
 	}
 
 	tracker := newIdleTracker(p.idleTimeout)
@@ -582,6 +598,11 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 			opts.Network.MakeHTTPClient(nil),
 		),
 		domainFrontingProxyProtocol: opts.DomainFrontingProxyProtocol,
+
+		ddShapeEnabled:    opts.DDShapeEnabled,
+		ddShapeDelayMinMs: opts.getDDShapeDelayMinMs(),
+		ddShapeDelayMaxMs: opts.getDDShapeDelayMaxMs(),
+		ddShapeFragBytes:  opts.getDDShapeFragBytes(),
 	}
 
 	proxy.doppelGanger.Run()

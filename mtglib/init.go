@@ -125,6 +125,15 @@ const (
 	// (and evicts aged connections). Must be < DCPoolConnMaxAge so aged
 	// connections are proactively replaced.
 	DCPoolRefreshInterval = 7 * time.Second
+
+	// DefaultDDShapeDelayMinMs and DefaultDDShapeDelayMaxMs bound the random
+	// delay before the first secured server-to-client response.
+	DefaultDDShapeDelayMinMs = 30
+	DefaultDDShapeDelayMaxMs = 100
+
+	// DefaultDDShapeFragBytes is the fragment size for the first secured
+	// server-to-client response.
+	DefaultDDShapeFragBytes = 88
 )
 
 // dcPoolWarmDCs is the list of Telegram DC ids the warm pool keeps connections
