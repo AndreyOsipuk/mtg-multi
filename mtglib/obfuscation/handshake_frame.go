@@ -60,11 +60,8 @@ func (h *handshakeFrame) dcSlice() []byte {
 func (h *handshakeFrame) dc() int {
 	idx := int16(binary.LittleEndian.Uint16(h.dcSlice()))
 
-	switch {
-	case idx > 0:
+	if idx != 0 {
 		return int(idx)
-	case idx < 0:
-		return -int(idx)
 	}
 
 	return defaultDC

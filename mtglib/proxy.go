@@ -410,9 +410,18 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 // streamContext — используется и клиентским путём, и filler'ом тёплого пула
 // (dcPool), у которого streamContext нет.
 func (p *Proxy) dialAndHandshake(ctx context.Context, dcID int) (essentials.Conn, dc.Addr, int, error) {
-	addresses := p.telegram.GetAddresses(dcID)
+	negativeDCID := dcID < 0
+	lookupDCID := dcID
+	if lookupDCID < 0 {
+		lookupDCID = -lookupDCID
+	}
+
+	addresses := p.telegram.GetAddresses(lookupDCID)
 	if len(addresses) == 0 && p.allowFallbackOnUnknownDC {
 		dcID = dc.DefaultDC
+		if negativeDCID {
+			dcID = -dc.DefaultDC
+		}
 		addresses = p.telegram.GetAddresses(dc.DefaultDC)
 	}
 
