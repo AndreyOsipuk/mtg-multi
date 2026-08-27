@@ -54,6 +54,32 @@ func TestOnConnectDisconnect(t *testing.T) {
 	assert.Equal(t, int64(0), stats.users["alice"].connections.Load())
 }
 
+func TestActiveIPsTrackConnectionCounts(t *testing.T) {
+	t.Parallel()
+
+	stats := NewProxyStats()
+	stats.OnConnectIP("alice", "192.0.2.1")
+	stats.OnConnectIP("alice", "192.0.2.1")
+	stats.OnConnectIP("alice", "198.51.100.2")
+	stats.OnDisconnectIP("alice", "192.0.2.1")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	stats.ServeHTTP(rec, req)
+
+	var resp StatsResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, []string{"192.0.2.1", "198.51.100.2"}, resp.Users["alice"].ActiveIPs)
+
+	stats.OnDisconnectIP("alice", "192.0.2.1")
+	stats.OnDisconnectIP("alice", "198.51.100.2")
+
+	rec = httptest.NewRecorder()
+	stats.ServeHTTP(rec, req)
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Users["alice"].ActiveIPs)
+}
+
 func TestAddBytes(t *testing.T) {
 	t.Parallel()
 

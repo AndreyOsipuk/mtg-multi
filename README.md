@@ -36,11 +36,26 @@ GET /stats
       "connections": 8,
       "bytes_in": 1048576,
       "bytes_out": 2097152,
-      "last_seen": "2026-03-29T11:25:30Z"
+      "last_seen": "2026-03-29T11:25:30Z",
+      "active_ips": ["192.0.2.10"]
     }
   }
 }
 ```
+
+**Secured multi-secret handshakes.** The same named 16-byte keys can be used
+with either FakeTLS (`ee`) or secured (`dd`) Telegram links. The proxy detects
+the transport and matches secured handshakes against the configured keys
+without changing `config.toml`.
+
+**Warm Telegram DC connections.** The binary keeps two ready connections per
+Telegram DC by default to avoid a cold dial on the client path. Set
+`MTG_DC_POOL=off` to disable the pool or `MTG_DC_POOL_SIZE=N` to change its
+per-DC size.
+
+**Optional secured-response shaping.** Set `MTG_DD_SHAPE=on` to delay the first
+secured server response by 30–100 ms and split that first write into 88-byte
+fragments. FakeTLS and subsequent bulk writes are unchanged.
 
 **Connection throttling.** Automatic per-user connection limits to protect the server from overload. A background goroutine recomputes caps every few seconds using a fair-share algorithm: small users keep their connections, remaining budget is split equally among heavy consumers. New connections from over-cap users are rejected; existing connections are not killed.
 
@@ -146,11 +161,26 @@ GET /stats
       "connections": 8,
       "bytes_in": 1048576,
       "bytes_out": 2097152,
-      "last_seen": "2026-03-29T11:25:30Z"
+      "last_seen": "2026-03-29T11:25:30Z",
+      "active_ips": ["192.0.2.10"]
     }
   }
 }
 ```
+
+**Secured multi-secret подключения.** Одни и те же именованные 16-байтные
+ключи работают со ссылками Telegram как в режиме FakeTLS (`ee`), так и secured
+(`dd`). Прокси автоматически определяет транспорт и сопоставляет secured
+рукопожатие с ключом из существующего `config.toml`.
+
+**Тёплые подключения к Telegram DC.** По умолчанию бинарник держит по два
+готовых подключения к каждому DC, чтобы клиент не ждал холодный dial. Пул можно
+отключить через `MTG_DC_POOL=off`, а его размер изменить через
+`MTG_DC_POOL_SIZE=N`.
+
+**Опциональная маскировка secured-ответа.** `MTG_DD_SHAPE=on` добавляет задержку
+30–100 мс перед первым secured-ответом сервера и дробит первую запись на
+фрагменты по 88 байт. FakeTLS и последующий bulk-трафик не меняются.
 
 **Троттлинг подключений.** Автоматические per-user лимиты для защиты сервера от перегрузки. Фоновая горутина каждые несколько секунд пересчитывает капы по алгоритму fair-share: маленькие пользователи сохраняют свои подключения, оставшийся бюджет делится поровну между крупными потребителями. Новые подключения сверх капа отклоняются; существующие не разрываются.
 

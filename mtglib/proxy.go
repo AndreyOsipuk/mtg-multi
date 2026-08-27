@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sort"
 	"strconv"
@@ -37,6 +38,12 @@ type Proxy struct {
 	telegram                    *dc.Telegram
 	configUpdater               *dc.PublicConfigUpdater
 	doppelGanger                *doppel.Ganger
+	dcPool                      *dcPool
+
+	ddShapeEnabled    bool
+	ddShapeDelayMinMs int
+	ddShapeDelayMaxMs int
+	ddShapeFragBytes  int
 
 	stats           *ProxyStats
 	secrets         []Secret
@@ -107,20 +114,29 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	p.stats.OnConnect(ctx.secretName)
 	p.stats.UpdateLastSeen(ctx.secretName)
 
+	clientIP := ctx.ClientIP().String()
+	p.stats.OnConnectIP(ctx.secretName, clientIP)
+
 	defer p.stats.OnDisconnect(ctx.secretName)
+	defer p.stats.OnDisconnectIP(ctx.secretName, clientIP)
 
-	clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
-	if err != nil {
-		ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
-		return
-	}
-	defer clientConn.Stop()
+	// FakeTLS-специфика: doppelganger-обёртка (калибровка TLS-шума) + отдельное
+	// obfuscated2-рукопожатие поверх распакованного TLS. Для secured (dd) это уже
+	// сделано в doSecuredHandshake напрямую — пропускаем.
+	if !ctx.secured {
+		clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
+		if err != nil {
+			ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
+			return
+		}
+		defer clientConn.Stop()
 
-	ctx.clientConn = clientConn
+		ctx.clientConn = clientConn
 
-	if err := p.doObfuscatedHandshake(ctx); err != nil {
-		ctx.logger.InfoError("obfuscated handshake is failed", err)
-		return
+		if err := p.doObfuscatedHandshake(ctx); err != nil {
+			ctx.logger.InfoError("obfuscated handshake is failed", err)
+			return
+		}
 	}
 
 	if err := ctx.clientConn.SetDeadline(time.Time{}); err != nil {
@@ -131,6 +147,17 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	if err := p.doTelegramCall(ctx); err != nil {
 		ctx.logger.WarningError("cannot dial to telegram", err)
 		return
+	}
+
+	// Shape only the first secured server response. FakeTLS connections already
+	// have a TLS wrapper and keep their existing behavior.
+	if ctx.secured && p.ddShapeEnabled {
+		ctx.clientConn = newShapedClientConn(
+			ctx.clientConn,
+			p.ddShapeDelayMinMs,
+			p.ddShapeDelayMaxMs,
+			p.ddShapeFragBytes,
+		)
 	}
 
 	tracker := newIdleTracker(p.idleTimeout)
@@ -199,6 +226,11 @@ func (p *Proxy) Shutdown() {
 	p.streamWaitGroup.Wait()
 	p.workerPool.Release()
 	p.configUpdater.Wait()
+
+	if p.dcPool != nil {
+		p.dcPool.Shutdown()
+	}
+
 	p.doppelGanger.Shutdown()
 
 	p.allowlist.Shutdown()
@@ -214,6 +246,31 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		secretKeys[i] = p.secrets[i].Key[:]
 	}
 
+	// Classify the transport before invoking a parser. In particular, a TLS
+	// ClientHello with an invalid HMAC is an active probe and must be forwarded
+	// byte-for-byte to the mask host; parsing its first 64 bytes as a secured
+	// handshake would consume and corrupt the fallback stream.
+	firstBytes := [5]byte{}
+	if _, err := io.ReadFull(rewind, firstBytes[:]); err != nil {
+		ctx.logger.InfoError("cannot read initial handshake bytes", err)
+		p.doDomainFrontingForHost(ctx, rewind, p.secrets[0].Host)
+
+		return false
+	}
+	rewind.Rewind()
+
+	if !isFakeTLSHandshake(firstBytes) {
+		ok, err := p.doSecuredHandshake(ctx, rewind)
+		if ok {
+			return true
+		}
+
+		ctx.logger.InfoError("cannot process secured handshake", err)
+		p.doDomainFrontingForHost(ctx, rewind, p.secrets[0].Host)
+
+		return false
+	}
+
 	result, err := fake.ReadClientHelloMulti(
 		rewind,
 		secretKeys,
@@ -221,7 +278,7 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		p.tolerateTimeSkewness,
 	)
 	if err != nil {
-		p.logger.InfoError("cannot read client hello", err)
+		ctx.logger.InfoError("cannot read client hello", err)
 
 		frontHost := p.secrets[0].Host
 		if result != nil && result.MatchedHost != "" {
@@ -259,6 +316,47 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	return true
 }
 
+func isFakeTLSHandshake(firstBytes [5]byte) bool {
+	return firstBytes[0] == tls.TypeHandshake &&
+		firstBytes[1] == 3 &&
+		firstBytes[2] == 1
+}
+
+// doSecuredHandshake обрабатывает соединение как secured (dd-секрет): obfuscated2
+// напрямую, без FakeTLS. Матчинг по 16б-ключу — конфиг остаётся ee, ключ у dd и
+// ee один и тот же. true = распознан и настроен; ServeConn дальше пропускает
+// FakeTLS-специфику (doppelganger + отдельный doObfuscatedHandshake).
+func (p *Proxy) doSecuredHandshake(ctx *streamContext, rewind *connRewind) (bool, error) {
+	rewind.Rewind()
+
+	secretKeys := make([][]byte, len(p.secrets))
+	for i := range p.secrets {
+		secretKeys[i] = p.secrets[i].Key[:]
+	}
+
+	idx, dcIdx, cn, replayKey, err := obfuscation.ReadHandshakeMulti(rewind, secretKeys)
+	if err != nil {
+		return false, err
+	}
+
+	if p.antiReplayCache.SeenBefore(replayKey) {
+		p.logger.Warning("replay attack has been detected (secured)!")
+		p.eventStream.Send(p.ctx, NewEventReplayAttack(ctx.streamID))
+
+		return false, errors.New("replay attack has been detected")
+	}
+
+	rewind.Commit()
+	ctx.secured = true
+	ctx.dc = dcIdx
+	ctx.clientConn = cn
+	ctx.matchedSecretKey = p.secrets[idx].Key[:]
+	ctx.secretName = p.secretNames[idx]
+	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName).BindInt("dc", dcIdx)
+
+	return true, nil
+}
+
 func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
 	// Use the secret key that was matched during the FakeTLS handshake.
 	obfs := obfuscation.Obfuscator{
@@ -280,11 +378,50 @@ func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
 func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 	dcid := ctx.dc
 
-	addresses := p.telegram.GetAddresses(dcid)
-	if len(addresses) == 0 && p.allowFallbackOnUnknownDC {
+	// Тёплый пул: если есть готовый коннект к нужному DC — берём его, минуя
+	// холодный dial+handshake (и Telegram-backoff при флапе маршрута нода→DC).
+	if p.dcPool != nil {
+		if conn, addr, ok := p.dcPool.get(dcid); ok {
+			p.attachTelegramConn(ctx, conn, addr)
+
+			return nil
+		}
+	}
+
+	conn, foundAddr, actualDC, err := p.dialAndHandshake(ctx, dcid)
+	if err != nil {
+		return err
+	}
+
+	if actualDC != dcid {
 		ctx.logger = ctx.logger.BindInt("original_dc", dcid)
 		ctx.logger.Warning("unknown DC, fallbacks")
-		ctx.dc = dc.DefaultDC
+		ctx.dc = actualDC
+	}
+
+	p.attachTelegramConn(ctx, conn, foundAddr)
+
+	return nil
+}
+
+// dialAndHandshake дилит DC dcID и делает obfuscated2-handshake, возвращая
+// obf-обёрнутый коннект (готов релеить), выбранный addr и ФАКТИЧЕСКИЙ dc (может
+// отличаться от запрошенного при AllowFallbackOnUnknownDC). НЕ трогает
+// streamContext — используется и клиентским путём, и filler'ом тёплого пула
+// (dcPool), у которого streamContext нет.
+func (p *Proxy) dialAndHandshake(ctx context.Context, dcID int) (essentials.Conn, dc.Addr, int, error) {
+	negativeDCID := dcID < 0
+	lookupDCID := dcID
+	if lookupDCID < 0 {
+		lookupDCID = -lookupDCID
+	}
+
+	addresses := p.telegram.GetAddresses(lookupDCID)
+	if len(addresses) == 0 && p.allowFallbackOnUnknownDC {
+		dcID = dc.DefaultDC
+		if negativeDCID {
+			dcID = -dc.DefaultDC
+		}
 		addresses = p.telegram.GetAddresses(dc.DefaultDC)
 	}
 
@@ -295,52 +432,53 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 	)
 
 	for _, addr := range addresses {
-		conn, err = p.network.Dial(addr.Network, addr.Address)
+		conn, err = p.network.DialContext(ctx, addr.Network, addr.Address)
 		if err == nil {
 			foundAddr = addr
 			break
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("no addresses to call: %w", err)
+		return nil, dc.Addr{}, 0, fmt.Errorf("no addresses to call: %w", err)
 	}
 	if conn == nil {
-		return fmt.Errorf("no available addresses for DC %d", ctx.dc)
+		return nil, dc.Addr{}, 0, fmt.Errorf("no available addresses for DC %d", dcID)
 	}
 
-	tgConn, err := foundAddr.Obfuscator.SendHandshake(conn, ctx.dc)
+	tgConn, err := foundAddr.Obfuscator.SendHandshake(conn, dcID)
 	if err != nil {
 		conn.Close() // nolint: errcheck
-		return fmt.Errorf("cannot perform server handshake: %w", err)
+
+		return nil, dc.Addr{}, 0, fmt.Errorf("cannot perform server handshake: %w", err)
 	}
 
+	return tgConn, foundAddr, dcID, nil
+}
+
+// attachTelegramConn вешает готовый (dial+handshake сделаны) коннект к DC на
+// streamContext и шлёт событие ConnectedToDC. Общий хвост для холодного dial и
+// тёплого пула.
+func (p *Proxy) attachTelegramConn(ctx *streamContext, conn essentials.Conn, addr dc.Addr) {
 	ctx.telegramConn = connTraffic{
-		Conn:     tgConn,
+		Conn:     conn,
 		streamID: ctx.streamID,
 		stream:   p.eventStream,
 		ctx:      ctx,
 	}
 
-	telegramHost, _, err := net.SplitHostPort(foundAddr.Address)
-	if err != nil {
-		conn.Close() //nolint: errcheck
-
-		return fmt.Errorf("cannot parse telegram address %s: %w", foundAddr.Address, err)
+	if telegramHost, _, err := net.SplitHostPort(addr.Address); err == nil {
+		p.eventStream.Send(
+			ctx,
+			NewEventConnectedToDC(ctx.streamID,
+				net.ParseIP(telegramHost),
+				ctx.dc),
+		)
 	}
-
-	p.eventStream.Send(
-		ctx,
-		NewEventConnectedToDC(ctx.streamID,
-			net.ParseIP(telegramHost),
-			ctx.dc),
-	)
-
-	return nil
 }
 
 func (p *Proxy) doDomainFrontingForHost(ctx *streamContext, conn *connRewind, host string) {
 	p.eventStream.Send(p.ctx, NewEventDomainFronting(ctx.streamID))
-	conn.Rewind()
+	conn.FinalRewind()
 
 	nativeDialer := p.network.NativeDialer()
 	fConn, err := nativeDialer.DialContext(ctx, "tcp", p.domainFrontingAddressForHost(host))
@@ -469,6 +607,11 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 			opts.Network.MakeHTTPClient(nil),
 		),
 		domainFrontingProxyProtocol: opts.DomainFrontingProxyProtocol,
+
+		ddShapeEnabled:    opts.DDShapeEnabled,
+		ddShapeDelayMinMs: opts.getDDShapeDelayMinMs(),
+		ddShapeDelayMaxMs: opts.getDDShapeDelayMaxMs(),
+		ddShapeFragBytes:  opts.getDDShapeFragBytes(),
 	}
 
 	proxy.doppelGanger.Run()
@@ -476,6 +619,21 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	if opts.AutoUpdate {
 		proxy.configUpdater.Run(ctx, dc.PublicConfigUpdateURLv4, "tcp4")
 		proxy.configUpdater.Run(ctx, dc.PublicConfigUpdateURLv6, "tcp6")
+	}
+
+	// Тёплый пул коннектов к DC (аналог me-pool telemt). Включён по умолчанию;
+	// filler'ы стартуют сразу и фейлят-ретраят, пока AutoUpdate не подтянет
+	// адреса DC — клиентов это не блокирует (фолбэк на холодный dial).
+	if opts.DCPoolEnabled {
+		proxy.dcPool = newDCPool(
+			ctx,
+			proxy.dialAndHandshake,
+			logger.Named("dc-pool"),
+			dcPoolWarmDCs,
+			opts.getDCPoolSize(),
+			DCPoolConnMaxAge,
+			DCPoolRefreshInterval,
+		)
 	}
 
 	pool, err := ants.NewPoolWithFunc(opts.getConcurrency(),

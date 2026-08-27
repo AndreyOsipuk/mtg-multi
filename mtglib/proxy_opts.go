@@ -205,6 +205,62 @@ type ProxyOpts struct {
 	//
 	// This is an optional setting.
 	ThrottleCheckInterval time.Duration
+
+	// DCPoolEnabled turns ON the warm DC connection pool (dcPool): it keeps a few
+	// pre-established connections to each Telegram DC so a client connect does
+	// not pay the cold dial+handshake and does not trigger Telegram client
+	// backoff when the node→DC route flaps.
+	//
+	// Off by default at the library level (least surprise for embedders and
+	// tests); the mtg binary enables it by default via run_proxy.
+	//
+	// This is an optional setting.
+	DCPoolEnabled bool
+
+	// DCPoolSize is the number of warm connections kept per DC. Defaults to
+	// DefaultDCPoolSize.
+	//
+	// This is an optional setting.
+	DCPoolSize uint
+
+	// DDShapeEnabled masks the first server-to-client response for secured
+	// connections with a random delay and fragmentation.
+	//
+	// This is an optional setting.
+	DDShapeEnabled bool
+
+	// DDShapeDelayMinMs and DDShapeDelayMaxMs bound the random delay before the
+	// first secured server-to-client write.
+	DDShapeDelayMinMs int
+	DDShapeDelayMaxMs int
+
+	// DDShapeFragBytes is the maximum fragment size for the first secured
+	// server-to-client write.
+	DDShapeFragBytes int
+}
+
+func (p ProxyOpts) getDDShapeDelayMinMs() int {
+	if p.DDShapeDelayMinMs == 0 {
+		return DefaultDDShapeDelayMinMs
+	}
+
+	return p.DDShapeDelayMinMs
+}
+
+func (p ProxyOpts) getDDShapeDelayMaxMs() int {
+	if p.DDShapeDelayMaxMs == 0 {
+		return DefaultDDShapeDelayMaxMs
+	}
+
+	return p.DDShapeDelayMaxMs
+}
+
+func (p ProxyOpts) getDDShapeFragBytes() int {
+	if p.DDShapeFragBytes == 0 {
+		return DefaultDDShapeFragBytes
+	}
+
+	return p.DDShapeFragBytes
 }
 
 func (p ProxyOpts) valid() error {
@@ -305,6 +361,14 @@ func (p ProxyOpts) getThrottleCheckInterval() time.Duration {
 	}
 
 	return p.ThrottleCheckInterval
+}
+
+func (p ProxyOpts) getDCPoolSize() int {
+	if p.DCPoolSize == 0 {
+		return DefaultDCPoolSize
+	}
+
+	return int(p.DCPoolSize)
 }
 
 func (p ProxyOpts) getLogger(name string) Logger {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,40 @@ type secretStats struct {
 	bytesIn     atomic.Int64
 	bytesOut    atomic.Int64
 	lastSeen    atomic.Value // stores time.Time
+
+	ipsMu sync.Mutex
+	ips   map[string]int
+}
+
+// RejectReason classifies why an incoming connection never became a proxied
+// session. Successful sessions are visible per user, but until these counters
+// existed a client that could not complete the handshake was invisible in
+// /stats: operators had to run tcpdump to notice, for example, a truncated
+// FakeTLS ClientHello (Telegram Desktop behind a censoring ISP, 18.08.2026).
+type RejectReason string
+
+const (
+	// RejectInitialBytes - could not even read the first 5 bytes.
+	RejectInitialBytes RejectReason = "initial_bytes"
+	// RejectSecuredHandshake - looked like dd, but the handshake failed.
+	RejectSecuredHandshake RejectReason = "secured_handshake"
+	// RejectClientHello - FakeTLS ClientHello unreadable/unmatched (truncated
+	// hello or wrong secret both land here).
+	RejectClientHello RejectReason = "client_hello"
+	// RejectReplay - anti-replay cache hit.
+	RejectReplay RejectReason = "replay"
+	// RejectWelcome - could not send the welcome packet back.
+	RejectWelcome RejectReason = "welcome"
+)
+
+// AllRejectReasons lists every reason in a stable order so the JSON response
+// always carries the same keys (zeros included) - graphs stay comparable.
+var AllRejectReasons = []RejectReason{
+	RejectInitialBytes,
+	RejectSecuredHandshake,
+	RejectClientHello,
+	RejectReplay,
+	RejectWelcome,
 }
 
 // ProxyStats tracks per-secret connection stats with atomic counters.
@@ -24,6 +59,11 @@ type ProxyStats struct {
 	mu        sync.RWMutex
 	users     map[string]*secretStats
 	startedAt time.Time
+
+	// Rejected handshakes by reason (see RejectReason). Not per-user: at the
+	// point of rejection the secret - hence the user - is usually unknown.
+	rejectedMu sync.Mutex
+	rejected   map[RejectReason]*atomic.Int64
 
 	// Throttle: per-user connection caps recomputed every throttleInterval.
 	throttleMu       sync.RWMutex
@@ -35,9 +75,15 @@ type ProxyStats struct {
 
 // NewProxyStats creates a new ProxyStats instance.
 func NewProxyStats() *ProxyStats {
+	rejected := make(map[RejectReason]*atomic.Int64, len(AllRejectReasons))
+	for _, reason := range AllRejectReasons {
+		rejected[reason] = &atomic.Int64{}
+	}
+
 	return &ProxyStats{
 		users:     make(map[string]*secretStats),
 		startedAt: time.Now(),
+		rejected:  rejected,
 	}
 }
 
@@ -66,6 +112,44 @@ func (s *ProxyStats) getOrCreate(name string) *secretStats {
 
 // PreRegister adds a secret name to the stats map so it appears in output
 // even if no connections have been made yet.
+// OnReject records a connection that was turned away before becoming a session.
+// Unknown reasons are counted too, so a future call site cannot silently vanish.
+func (s *ProxyStats) OnReject(reason RejectReason) {
+	if counter := s.rejectedCounter(reason); counter != nil {
+		counter.Add(1)
+	}
+}
+
+func (s *ProxyStats) rejectedCounter(reason RejectReason) *atomic.Int64 {
+	s.rejectedMu.Lock()
+	defer s.rejectedMu.Unlock()
+
+	if s.rejected == nil {
+		s.rejected = make(map[RejectReason]*atomic.Int64, len(AllRejectReasons))
+	}
+
+	counter, ok := s.rejected[reason]
+	if !ok {
+		counter = &atomic.Int64{}
+		s.rejected[reason] = counter
+	}
+
+	return counter
+}
+
+// RejectedSnapshot returns the current per-reason counters.
+func (s *ProxyStats) RejectedSnapshot() map[string]int64 {
+	s.rejectedMu.Lock()
+	defer s.rejectedMu.Unlock()
+
+	out := make(map[string]int64, len(s.rejected))
+	for reason, counter := range s.rejected {
+		out[string(reason)] = counter.Load()
+	}
+
+	return out
+}
+
 func (s *ProxyStats) PreRegister(name string) {
 	s.getOrCreate(name)
 }
@@ -78,6 +162,39 @@ func (s *ProxyStats) OnConnect(name string) {
 // OnDisconnect decrements the active connection count for the given secret.
 func (s *ProxyStats) OnDisconnect(name string) {
 	s.getOrCreate(name).connections.Add(-1)
+}
+
+// OnConnectIP registers an active client IP for a secret.
+func (s *ProxyStats) OnConnectIP(name, ip string) {
+	if ip == "" {
+		return
+	}
+
+	st := s.getOrCreate(name)
+	st.ipsMu.Lock()
+	defer st.ipsMu.Unlock()
+
+	if st.ips == nil {
+		st.ips = make(map[string]int)
+	}
+	st.ips[ip]++
+}
+
+// OnDisconnectIP unregisters an active client IP for a secret.
+func (s *ProxyStats) OnDisconnectIP(name, ip string) {
+	if ip == "" {
+		return
+	}
+
+	st := s.getOrCreate(name)
+	st.ipsMu.Lock()
+	defer st.ipsMu.Unlock()
+
+	if st.ips[ip] <= 1 {
+		delete(st.ips, ip)
+		return
+	}
+	st.ips[ip]--
 }
 
 // AddBytesIn adds to the bytes-in counter for the given secret.
@@ -218,8 +335,10 @@ type StatsResponse struct {
 	StartedAt        time.Time                `json:"started_at"`
 	UptimeSeconds    int64                    `json:"uptime_seconds"`
 	TotalConnections int64                    `json:"total_connections"`
-	Throttle         *ThrottleJSON            `json:"throttle,omitempty"`
-	Users            map[string]UserStatsJSON `json:"users"`
+	// Rejected counts handshakes that never became sessions, by reason.
+	Rejected map[string]int64         `json:"rejected"`
+	Throttle *ThrottleJSON            `json:"throttle,omitempty"`
+	Users    map[string]UserStatsJSON `json:"users"`
 }
 
 // ThrottleJSON is the throttle portion of the stats JSON response.
@@ -235,6 +354,7 @@ type UserStatsJSON struct {
 	BytesIn     int64      `json:"bytes_in"`
 	BytesOut    int64      `json:"bytes_out"`
 	LastSeen    *time.Time `json:"last_seen"`
+	ActiveIPs   []string   `json:"active_ips"`
 }
 
 func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -255,11 +375,20 @@ func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lastSeenPtr = &lastSeen
 		}
 
+		st.ipsMu.Lock()
+		activeIPs := make([]string, 0, len(st.ips))
+		for ip := range st.ips {
+			activeIPs = append(activeIPs, ip)
+		}
+		st.ipsMu.Unlock()
+		sort.Strings(activeIPs)
+
 		users[name] = UserStatsJSON{
 			Connections: conns,
 			BytesIn:     st.bytesIn.Load(),
 			BytesOut:    st.bytesOut.Load(),
 			LastSeen:    lastSeenPtr,
+			ActiveIPs:   activeIPs,
 		}
 	}
 
