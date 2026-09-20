@@ -20,6 +20,7 @@ import (
 	"github.com/dolonet/mtg-multi/mtglib"
 	"github.com/dolonet/mtg-multi/network/v2"
 	"github.com/dolonet/mtg-multi/stats"
+	"github.com/dolonet/mtg-multi/web"
 	"github.com/pires/go-proxyproto"
 	"github.com/rs/zerolog"
 	"github.com/yl2chen/cidranger"
@@ -375,6 +376,35 @@ func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyc
 	proxy, err := mtglib.NewProxy(opts)
 	if err != nil {
 		return fmt.Errorf("cannot create a proxy: %w", err)
+	}
+
+	// WEB-режим: MTProto внутри настоящего HTTPS. Каждый логический поток
+	// приходит в тот же ServeConn, что и обычное соединение, поэтому
+	// рукопожатие, статистика и DC-пул работают без изменений.
+	if web.Enabled() {
+		secrets := make(map[string][]byte, len(conf.GetSecrets()))
+		for name, secret := range conf.GetSecrets() {
+			key := make([]byte, len(secret.Key))
+			copy(key, secret.Key[:])
+			secrets[name] = key
+		}
+
+		webServer, webBind, err := web.SetupFromEnv(secrets, func(stream *web.Stream) {
+			proxy.ServeConn(stream)
+		})
+		if err != nil {
+			return fmt.Errorf("cannot configure web mode: %w", err)
+		}
+
+		if webServer != nil {
+			defer webServer.Close()
+
+			go func() {
+				if err := web.Serve(webServer, webBind); err != nil {
+					logger.WarningError("web listener stopped", err)
+				}
+			}()
+		}
 	}
 
 	bindAddrs := conf.GetBindAddrs()
