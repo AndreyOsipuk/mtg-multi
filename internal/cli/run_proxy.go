@@ -232,10 +232,8 @@ func warnSNIMismatch(conf *config.Config, ntw mtglib.Network, log mtglib.Logger)
 		return
 	}
 
-	v4Match := res.OurIPv4 == nil || res.IPv4Match
-	v6Match := res.OurIPv6 == nil || res.IPv6Match
-
-	if v4Match && v6Match {
+	v4Bad, v6Bad := res.familyMismatch()
+	if !v4Bad && !v6Bad {
 		return
 	}
 
@@ -262,11 +260,11 @@ func warnSNIMismatch(conf *config.Config, ntw mtglib.Network, log mtglib.Logger)
 		BindStr("public_ip", our)
 
 	if res.OurIPv4 != nil {
-		entry = entry.BindStr("ipv4_match", fmt.Sprintf("%t", v4Match))
+		entry = entry.BindStr("ipv4_match", fmt.Sprintf("%t", !v4Bad))
 	}
 
 	if res.OurIPv6 != nil {
-		entry = entry.BindStr("ipv6_match", fmt.Sprintf("%t", v6Match))
+		entry = entry.BindStr("ipv6_match", fmt.Sprintf("%t", !v6Bad))
 	}
 
 	entry.Warning("SNI-DNS mismatch: secret hostname does not resolve to this server's public IP. " +

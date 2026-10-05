@@ -76,6 +76,12 @@ const (
 	//     Type: counter
 	MetricConcurrencyLimited = "concurrency_limited"
 
+	// MetricDCPool defines a metric for warm DC pool activity: how many clients
+	// got a warm connection, dialed cold, and why pooled connections were dropped.
+	//
+	// Type: counter, tags: TagDC, TagDCPoolResult.
+	MetricDCPool = "dc_pool"
+
 	// MetricIPBlocklisted defines a metric for a count of events, when
 	// client was blocked because her IP address was found in blocklists.
 	//
@@ -110,6 +116,9 @@ const (
 
 	// TagDC defines a name of the 'dc' tag.
 	TagDC = "dc"
+
+	// TagDCPoolResult defines a name of the 'result' tag of MetricDCPool.
+	TagDCPoolResult = "result"
 
 	// TagDirection defines a name of the 'direction' tag.
 	TagDirection = "direction"

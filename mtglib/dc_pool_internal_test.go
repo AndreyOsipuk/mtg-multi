@@ -165,7 +165,7 @@ func TestDCPoolShutdownClosesConns(t *testing.T) {
 		return c, testAddr(), dcID, nil
 	}
 
-	pool := newDCPool(context.Background(), dial, NoopLogger{},
+	pool := newDCPool(context.Background(), dial, NoopLogger{}, nil,
 		[]int{2}, 2, 20*time.Second, 5*time.Millisecond)
 
 	// Ждём, пока filler прогреет пул до полного (perDC=2). НЕ забираем через
@@ -196,4 +196,168 @@ func TestDCPoolShutdownClosesConns(t *testing.T) {
 			t.Fatalf("коннект #%d не закрыт после Shutdown", i)
 		}
 	}
+}
+
+// recorder собирает исходы пула для проверки метрики mtg_dc_pool.
+type recorder struct {
+	mu      sync.Mutex
+	results []string
+}
+
+func (r *recorder) observe(_ int, result string) {
+	r.mu.Lock()
+	r.results = append(r.results, result)
+	r.mu.Unlock()
+}
+
+func (r *recorder) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]string(nil), r.results...)
+}
+
+func equalResults(t *testing.T, got, want []string) {
+	t.Helper()
+
+	if len(got) != len(want) {
+		t.Fatalf("исходы: получили %v, ожидали %v", got, want)
+	}
+
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("исходы: получили %v, ожидали %v", got, want)
+		}
+	}
+}
+
+// Коннект, который DC закрыл, пока он лежал в пуле, клиенту не отдаётся: иначе
+// первый write клиента упадёт и Telegram-клиент уйдёт в backoff (02.10.2026 -
+// раньше get смотрел только на возраст).
+func TestDCPoolGetSkipsDeadConn(t *testing.T) {
+	p := newTestPool(nil, 2, 20*time.Second)
+	rec := &recorder{}
+	p.observe = rec.observe
+
+	alive := &fakePoolConn{}
+	dead := &fakePoolConn{}
+	p.alive = func(c essentials.Conn) bool { return c.(*fakePoolConn) != dead } //nolint: forcetypeassert
+
+	p.ready[2] = []warmConn{
+		{conn: alive, addr: testAddr(), created: time.Now()},
+		{conn: dead, addr: testAddr(), created: time.Now()},
+	}
+
+	conn, _, ok := p.get(2)
+	if !ok || conn.(*fakePoolConn) != alive { //nolint: forcetypeassert
+		t.Fatal("ожидали живой коннект")
+	}
+
+	if !dead.isClosed() {
+		t.Fatal("мёртвый коннект должен быть закрыт")
+	}
+
+	equalResults(t, rec.all(), []string{DCPoolResultDead, DCPoolResultHit})
+}
+
+// Все коннекты мёртвые - промах, клиент дилит холодно.
+func TestDCPoolGetAllDeadIsMiss(t *testing.T) {
+	p := newTestPool(nil, 2, 20*time.Second)
+	rec := &recorder{}
+	p.observe = rec.observe
+	p.alive = func(essentials.Conn) bool { return false }
+
+	p.ready[2] = []warmConn{
+		{conn: &fakePoolConn{}, addr: testAddr(), created: time.Now()},
+		{conn: &fakePoolConn{}, addr: testAddr(), created: time.Now()},
+	}
+
+	if _, _, ok := p.get(2); ok {
+		t.Fatal("ожидали промах")
+	}
+
+	equalResults(t, rec.all(), []string{DCPoolResultDead, DCPoolResultDead, DCPoolResultMiss})
+}
+
+// Исходы filler'а и выдачи: прогрев, вытеснение по возрасту, ошибка прогрева,
+// протухший при выдаче, промах.
+func TestDCPoolReportsResults(t *testing.T) {
+	fail := false
+	dial := func(_ context.Context, dcID int) (essentials.Conn, dc.Addr, int, error) {
+		if fail {
+			return nil, dc.Addr{}, 0, errors.New("dc down")
+		}
+
+		return &fakePoolConn{}, testAddr(), dcID, nil
+	}
+
+	p := newTestPool(dial, 1, 20*time.Second)
+	rec := &recorder{}
+	p.observe = rec.observe
+
+	p.topUp(context.Background(), 2) // dial_ok
+
+	p.mu.Lock()
+	p.ready[2][0].created = time.Now().Add(-time.Hour)
+	p.mu.Unlock()
+
+	fail = true
+	p.topUp(context.Background(), 2) // expired + dial_fail
+
+	p.ready[2] = []warmConn{{conn: &fakePoolConn{}, addr: testAddr(), created: time.Now().Add(-time.Hour)}}
+	p.get(2) // stale + miss
+
+	equalResults(t, rec.all(), []string{
+		DCPoolResultDialOK,
+		DCPoolResultExpired, DCPoolResultDialFail,
+		DCPoolResultStale, DCPoolResultMiss,
+	})
+}
+
+// Настоящая проба на net.Pipe: живой коннект молчит - живой; закрытый на той
+// стороне - мёртвый; DC прислал данные - тоже мёртвый (на неначатом потоке так
+// быть не должно). После пробы дедлайн снят: коннект дальше читается как обычно.
+func TestProbeAlive(t *testing.T) {
+	t.Run("молчит - живой, дедлайн снят", func(t *testing.T) {
+		local, remote := net.Pipe()
+		defer local.Close()  //nolint: errcheck
+		defer remote.Close() //nolint: errcheck
+
+		conn := essentials.WrapNetConn(local)
+		if !probeAlive(conn) {
+			t.Fatal("молчащий коннект должен считаться живым")
+		}
+
+		go remote.Write([]byte{42}) //nolint: errcheck
+
+		buf := make([]byte, 1)
+		if _, err := conn.Read(buf); err != nil || buf[0] != 42 {
+			t.Fatalf("после пробы чтение должно работать: %v %v", buf, err)
+		}
+	})
+
+	t.Run("закрыт DC - мёртвый", func(t *testing.T) {
+		local, remote := net.Pipe()
+		defer local.Close() //nolint: errcheck
+
+		remote.Close() //nolint: errcheck
+
+		if probeAlive(essentials.WrapNetConn(local)) {
+			t.Fatal("закрытый коннект должен считаться мёртвым")
+		}
+	})
+
+	t.Run("DC прислал данные - мёртвый", func(t *testing.T) {
+		local, remote := net.Pipe()
+		defer local.Close()  //nolint: errcheck
+		defer remote.Close() //nolint: errcheck
+
+		go remote.Write([]byte{1}) //nolint: errcheck
+
+		time.Sleep(10 * time.Millisecond)
+
+		if probeAlive(essentials.WrapNetConn(local)) {
+			t.Fatal("коннект с неожиданными данными должен считаться мёртвым")
+		}
+	})
 }

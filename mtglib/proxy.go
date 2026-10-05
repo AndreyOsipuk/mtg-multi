@@ -629,6 +629,9 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 			ctx,
 			proxy.dialAndHandshake,
 			logger.Named("dc-pool"),
+			func(dcID int, result string) {
+				proxy.eventStream.Send(proxy.ctx, NewEventDCPool(dcID, result))
+			},
 			dcPoolWarmDCs,
 			opts.getDCPoolSize(),
 			DCPoolConnMaxAge,

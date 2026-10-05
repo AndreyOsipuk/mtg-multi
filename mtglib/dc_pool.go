@@ -2,6 +2,8 @@ package mtglib
 
 import (
 	"context"
+	"errors"
+	"net"
 	"sync"
 	"time"
 
@@ -24,6 +26,51 @@ type warmConn struct {
 // мок, без сети.
 type dcDialFunc func(ctx context.Context, dcID int) (essentials.Conn, dc.Addr, int, error)
 
+// Исходы работы пула для метрики mtg_dc_pool{dc,result}. Без них не видно, помогает
+// ли пул вообще: сколько клиентов получили тёплый коннект, сколько ушли в холодный
+// dial и почему (02.10.2026).
+const (
+	DCPoolResultHit      = "hit"       // клиент получил тёплый коннект
+	DCPoolResultMiss     = "miss"      // пул пуст - клиент дилит холодно
+	DCPoolResultStale    = "stale"     // при выдаче коннект оказался старше maxAge
+	DCPoolResultDead     = "dead"      // при выдаче коннект оказался закрыт DC
+	DCPoolResultExpired  = "expired"   // фоновое вытеснение по возрасту (норма)
+	DCPoolResultDialOK   = "dial_ok"   // filler прогрел коннект
+	DCPoolResultDialFail = "dial_fail" // filler не смог прогреть
+)
+
+// dcPoolObserver получает исходы работы пула (в проде - в поток событий/метрики).
+type dcPoolObserver func(dcID int, result string)
+
+// dcPoolLivenessProbe - сколько ждём при проверке живости. Telegram никогда не шлёт
+// первым, поэтому у живого коннекта чтение упирается в таймаут, а у закрытого DC
+// сразу отдаёт EOF/RST. 1 мс - цена проверки на каждого клиента.
+const dcPoolLivenessProbe = time.Millisecond
+
+// probeAlive проверяет, не закрыл ли DC тёплый коннект, пока тот лежал в пуле.
+// Возраст (maxAge) этого не ловит: DC может закрыть коннект в любой момент (рестарт,
+// ротация, сброс по сети), и тогда клиент получает мёртвый коннект и Telegram-backoff.
+// Живой = чтение упёрлось в таймаут. Любые данные, EOF или сброс - мёртвый: на
+// неначатом MTProto-потоке DC не должен присылать ничего. Чтение по таймауту не
+// продвигает шифр obfuscated2 (обёртка расшифровывает только прочитанное).
+func probeAlive(conn essentials.Conn) bool {
+	if err := conn.SetReadDeadline(time.Now().Add(dcPoolLivenessProbe)); err != nil {
+		return false
+	}
+
+	var buf [1]byte
+
+	_, err := conn.Read(buf[:])
+
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return false
+	}
+
+	var netErr net.Error
+
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 // dcPool держит тёплые коннекты к DC Telegram, чтобы клиентский коннект НЕ платил
 // за холодный dial+handshake на каждый вход. Аналог me-pool в telemt.
 //
@@ -41,6 +88,8 @@ type dcDialFunc func(ctx context.Context, dcID int) (essentials.Conn, dc.Addr, i
 type dcPool struct {
 	dial     dcDialFunc
 	logger   Logger
+	observe  dcPoolObserver
+	alive    func(essentials.Conn) bool
 	dcs      []int
 	perDC    int
 	maxAge   time.Duration
@@ -55,7 +104,7 @@ type dcPool struct {
 
 // newDCPool создаёт пул и запускает filler-горутины. ctx — жизненный цикл проксей
 // (отменяется в Shutdown). dcs — список DC для прогрева (обычно 1..5).
-func newDCPool(ctx context.Context, dial dcDialFunc, logger Logger,
+func newDCPool(ctx context.Context, dial dcDialFunc, logger Logger, observe dcPoolObserver,
 	dcs []int, perDC int, maxAge, interval time.Duration,
 ) *dcPool {
 	ctx, cancel := context.WithCancel(ctx)
@@ -63,6 +112,8 @@ func newDCPool(ctx context.Context, dial dcDialFunc, logger Logger,
 	p := &dcPool{
 		dial:     dial,
 		logger:   logger,
+		observe:  observe,
+		alive:    probeAlive,
 		dcs:      dcs,
 		perDC:    perDC,
 		maxAge:   maxAge,
@@ -80,33 +131,61 @@ func newDCPool(ctx context.Context, dial dcDialFunc, logger Logger,
 	return p
 }
 
-// get отдаёт тёплый коннект к dcID, если есть свежий. Протухшие по пути закрывает
-// и пропускает (клиенту стухший коннект не отдаём — иначе первый write упадёт и
-// клиент словит backoff). ok=false → в пуле пусто/всё протухло, вызывающий дилит
-// холодно.
+// get отдаёт тёплый коннект к dcID, если есть свежий и живой. Протухшие и
+// закрытые DC по пути закрывает и пропускает (клиенту мёртвый коннект не отдаём -
+// иначе первый write упадёт и клиент словит backoff). ok=false → в пуле пусто/всё
+// негодное, вызывающий дилит холодно. Проба живости идёт без мьютекса: она ждёт
+// до dcPoolLivenessProbe, и держать на это время весь пул незачем.
 func (p *dcPool) get(dcID int) (essentials.Conn, dc.Addr, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	for {
+		wc, ok := p.pop(dcID)
+		if !ok {
+			p.report(dcID, DCPoolResultMiss)
 
-	conns := p.ready[dcID]
-	for len(conns) > 0 {
-		wc := conns[len(conns)-1]
-		conns = conns[:len(conns)-1]
+			return nil, dc.Addr{}, false
+		}
 
 		if time.Since(wc.created) >= p.maxAge {
 			wc.conn.Close() //nolint: errcheck
+			p.report(dcID, DCPoolResultStale)
 
 			continue
 		}
 
-		p.ready[dcID] = conns
+		if p.alive != nil && !p.alive(wc.conn) {
+			wc.conn.Close() //nolint: errcheck
+			p.report(dcID, DCPoolResultDead)
+
+			continue
+		}
+
+		p.report(dcID, DCPoolResultHit)
 
 		return wc.conn, wc.addr, true
 	}
+}
 
-	p.ready[dcID] = conns
+// pop снимает с пула самый свежий коннект dcID.
+func (p *dcPool) pop(dcID int) (warmConn, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	return nil, dc.Addr{}, false
+	conns := p.ready[dcID]
+	if len(conns) == 0 {
+		return warmConn{}, false
+	}
+
+	wc := conns[len(conns)-1]
+	p.ready[dcID] = conns[:len(conns)-1]
+
+	return wc, true
+}
+
+// report отдаёт исход наблюдателю (метрики), если он задан.
+func (p *dcPool) report(dcID int, result string) {
+	if p.observe != nil {
+		p.observe(dcID, result)
+	}
 }
 
 // fill — filler-горутина одного DC: пополняет пул до perDC и вытесняет протухшие
@@ -135,9 +214,13 @@ func (p *dcPool) topUp(ctx context.Context, dcID int) {
 
 	var live []warmConn
 
+	expired := 0
+
 	for _, wc := range p.ready[dcID] {
 		if time.Since(wc.created) >= p.maxAge {
 			wc.conn.Close() //nolint: errcheck
+
+			expired++
 
 			continue
 		}
@@ -150,6 +233,10 @@ func (p *dcPool) topUp(ctx context.Context, dcID int) {
 
 	p.mu.Unlock()
 
+	for i := 0; i < expired; i++ {
+		p.report(dcID, DCPoolResultExpired)
+	}
+
 	for i := 0; i < need; i++ {
 		if ctx.Err() != nil {
 			return
@@ -160,6 +247,7 @@ func (p *dcPool) topUp(ctx context.Context, dcID int) {
 			// DC ещё не доступен (config не загружен) или маршрут лёг — попробуем
 			// на следующем тике, клиентов это не блокирует (фолбэк на холодный dial).
 			p.logger.InfoError("dc pool warm dial failed", err)
+			p.report(dcID, DCPoolResultDialFail)
 
 			return
 		}
@@ -176,6 +264,8 @@ func (p *dcPool) topUp(ctx context.Context, dcID int) {
 		p.mu.Lock()
 		p.ready[dcID] = append(p.ready[dcID], warmConn{conn: conn, addr: addr, created: time.Now()})
 		p.mu.Unlock()
+
+		p.report(dcID, DCPoolResultDialOK)
 	}
 }
 

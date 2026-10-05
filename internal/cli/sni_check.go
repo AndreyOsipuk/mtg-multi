@@ -25,6 +25,26 @@ type sniCheckResult struct {
 	ResolveErr error
 }
 
+// familyMismatch reports, per IP family, whether the startup warning should
+// fire. A family is checked only when this server knows its public IP in that
+// family AND the hostname actually has records of that family - the rule of
+// upstream mtg (sni-graceful-degradation). Without the second condition a
+// server with IPv6 but a hostname with only A records got a false mismatch.
+func (r sniCheckResult) familyMismatch() (v4, v6 bool) {
+	has4, has6 := false, false
+
+	for _, ip := range r.Resolved {
+		if ip.To4() != nil {
+			has4 = true
+		} else {
+			has6 = true
+		}
+	}
+
+	return r.OurIPv4 != nil && has4 && !r.IPv4Match,
+		r.OurIPv6 != nil && has6 && !r.IPv6Match
+}
+
 // PublicIPKnown reports whether at least one public IP family was detected.
 func (r sniCheckResult) PublicIPKnown() bool {
 	return r.OurIPv4 != nil || r.OurIPv6 != nil
