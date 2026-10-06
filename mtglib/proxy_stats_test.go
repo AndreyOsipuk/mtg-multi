@@ -58,6 +58,10 @@ func TestActiveIPsTrackConnectionCounts(t *testing.T) {
 	t.Parallel()
 
 	stats := NewProxyStats()
+	// Как в прокси: пользователь из конфига зарегистрирован заранее, учёт IP
+	// сам записей не создаёт (иначе воскрешал бы удалённых по SIGHUP).
+	stats.PreRegister("alice")
+	stats.OnConnectIP("bob", "203.0.113.9")
 	stats.OnConnectIP("alice", "192.0.2.1")
 	stats.OnConnectIP("alice", "192.0.2.1")
 	stats.OnConnectIP("alice", "198.51.100.2")
@@ -70,6 +74,7 @@ func TestActiveIPsTrackConnectionCounts(t *testing.T) {
 	var resp StatsResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	assert.Equal(t, []string{"192.0.2.1", "198.51.100.2"}, resp.Users["alice"].ActiveIPs)
+	assert.NotContains(t, resp.Users, "bob")
 
 	stats.OnDisconnectIP("alice", "192.0.2.1")
 	stats.OnDisconnectIP("alice", "198.51.100.2")

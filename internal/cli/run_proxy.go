@@ -258,7 +258,10 @@ func warnDeprecatedDomainFronting(conf *config.Config, log mtglib.Logger) {
 	}
 }
 
-func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyclop
+// runProxy runs the proxy until SIGINT/SIGTERM. If readConfig is not nil,
+// SIGHUP re-reads the configuration and applies its secrets without a
+// restart.
+func runProxy(conf *config.Config, version string, readConfig func() (*config.Config, error)) error { //nolint: funlen, cyclop
 	logger := makeLogger(conf)
 
 	logger.BindJSON("configuration", conf.String()).Debug("configuration")
@@ -358,17 +361,14 @@ func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyc
 	// WEB-режим: MTProto внутри настоящего HTTPS. Каждый логический поток
 	// приходит в тот же ServeConn, что и обычное соединение, поэтому
 	// рукопожатие, статистика и DC-пул работают без изменений.
-	if web.Enabled() {
-		secrets := make(map[string][]byte, len(conf.GetSecrets()))
-		for name, secret := range conf.GetSecrets() {
-			key := make([]byte, len(secret.Key))
-			copy(key, secret.Key[:])
-			secrets[name] = key
-		}
+	var webServer *web.Server
 
+	if web.Enabled() {
 		// Через общий допуск: allowlist/blocklist и пул воркеров с лимитом
 		// concurrency, как у обычного соединения (раньше WEB шёл мимо них).
-		webServer, webBind, err := web.SetupFromEnv(secrets, func(stream *web.Stream) {
+		var webBind string
+
+		webServer, webBind, err = web.SetupFromEnv(webSecrets(conf.GetSecrets()), func(stream *web.Stream) {
 			proxy.ServeStream(stream)
 		})
 		if err != nil {
@@ -431,6 +431,15 @@ func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyc
 
 		cancel()
 	}()
+
+	if readConfig != nil {
+		var updater secretsUpdater = proxy
+		if webServer != nil {
+			updater = webProxyUpdater{proxy: proxy, web: webServer}
+		}
+
+		go watchReload(ctx, utils.ReloadSignals(), readConfig, updater, logger.Named("reload"))
+	}
 
 	<-ctx.Done()
 	listener.Close() //nolint: errcheck

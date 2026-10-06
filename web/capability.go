@@ -23,6 +23,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"sync/atomic"
 )
 
 // capabilityContext - константа протокола Telegram Desktop. Менять нельзя:
@@ -133,9 +134,10 @@ type Profile struct {
 	SecretMode SecretMode
 }
 
-// ProfileTable - таблица профилей одного vhost.
+// ProfileTable - таблица профилей одного vhost. Содержимое можно заменить на
+// лету (Replace): так новые пользователи попадают в WEB без рестарта.
 type ProfileTable struct {
-	profiles []Profile
+	profiles atomic.Pointer[[]Profile]
 }
 
 // NewProfileTable строит таблицу и отвергает совпадающие capability.
@@ -143,11 +145,22 @@ type ProfileTable struct {
 // Совпадение означало бы, что два пользователя неразличимы (одинаковый секрет),
 // и трафик одного пошёл бы в статистику другого. Лучше отказать на старте.
 func NewProfileTable(profiles []Profile) (*ProfileTable, error) {
+	table := &ProfileTable{}
+	if err := table.Replace(profiles); err != nil {
+		return nil, err
+	}
+
+	return table, nil
+}
+
+// Replace атомарно подменяет профили. При совпадающих capability таблица
+// остаётся прежней.
+func (t *ProfileTable) Replace(profiles []Profile) error {
 	seen := make(map[[CapabilityLen]byte]string, len(profiles))
 
 	for _, profile := range profiles {
 		if previous, ok := seen[profile.Capability]; ok {
-			return nil, errors.New("web: одинаковый capability у пользователей " + previous + " и " + profile.User)
+			return errors.New("web: одинаковый capability у пользователей " + previous + " и " + profile.User)
 		}
 
 		seen[profile.Capability] = profile.User
@@ -155,8 +168,9 @@ func NewProfileTable(profiles []Profile) (*ProfileTable, error) {
 
 	table := make([]Profile, len(profiles))
 	copy(table, profiles)
+	t.profiles.Store(&table)
 
-	return &ProfileTable{profiles: table}, nil
+	return nil
 }
 
 // Match ищет профиль по значению из строки запроса.
@@ -171,7 +185,7 @@ func (t *ProfileTable) Match(candidate [CapabilityLen]byte) (Profile, bool) {
 		hit   int
 	)
 
-	for _, profile := range t.profiles {
+	for _, profile := range *t.profiles.Load() {
 		equal := subtle.ConstantTimeCompare(profile.Capability[:], candidate[:])
 		if equal == 1 {
 			found = profile
@@ -184,5 +198,5 @@ func (t *ProfileTable) Match(candidate [CapabilityLen]byte) (Profile, bool) {
 
 // Len возвращает число профилей в таблице.
 func (t *ProfileTable) Len() int {
-	return len(t.profiles)
+	return len(*t.profiles.Load())
 }

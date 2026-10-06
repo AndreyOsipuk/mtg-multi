@@ -115,7 +115,7 @@ func SetupFromEnv(secrets map[string][]byte, handle func(*Stream)) (*Server, str
 	}
 
 	cfg := DefaultServerConfig()
-	cfg.VHosts = []VHost{{Host: host, Profiles: table, Decoy: newDecoy(os.Getenv(envDecoyDir))}}
+	cfg.VHosts = []VHost{{Host: host, Profiles: table, Decoy: newDecoy(os.Getenv(envDecoyDir)), SecretMode: mode}}
 	cfg.TrustedProxyCIDRs = trusted
 	cfg.Bridge = DefaultBridge{}
 	cfg.Handle = handle

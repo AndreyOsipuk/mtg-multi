@@ -50,6 +50,9 @@ type VHost struct {
 	Host     string
 	Profiles *ProfileTable
 	Decoy    Decoy
+	// SecretMode - режим ссылок, с которым строятся профили; нужен, чтобы
+	// пересобрать таблицу в UpdateSecrets.
+	SecretMode SecretMode
 }
 
 // ServerConfig - настройки HTTP-входа.
@@ -129,6 +132,40 @@ func NewServer(cfg ServerConfig) *Server {
 	go srv.collectExpired()
 
 	return srv
+}
+
+// UpdateSecrets пересобирает профили всех vhost по новому списку секретов (по
+// SIGHUP вместе с секретами прокси). Сначала строит все таблицы и только потом
+// подменяет: при ошибке не меняется ничего. Живые сессии не трогает - потоки
+// удалённого пользователя закрывает сам прокси, а новые не пройдут рукопожатие.
+func (s *Server) UpdateSecrets(secrets map[string][]byte) error {
+	if len(secrets) == 0 {
+		return ErrNoSecrets
+	}
+
+	built := make(map[string][]Profile, len(s.vhosts))
+
+	for key, vhost := range s.vhosts {
+		profiles, err := BuildProfiles(secrets, vhost.Host, vhost.SecretMode)
+		if err != nil {
+			return err
+		}
+
+		// Проверка на совпадающие capability - той же функцией, что на старте.
+		if _, err := NewProfileTable(profiles); err != nil {
+			return err
+		}
+
+		built[key] = profiles
+	}
+
+	for key, profiles := range built {
+		if err := s.vhosts[key].Profiles.Replace(profiles); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Close завершает все сессии и останавливает уборку.
