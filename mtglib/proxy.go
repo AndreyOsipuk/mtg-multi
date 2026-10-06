@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sort"
 	"strconv"
@@ -146,6 +147,7 @@ type Proxy struct {
 	streamWaitGroup sync.WaitGroup
 
 	allowFallbackOnUnknownDC    bool
+	securedEnabled              bool
 	tolerateTimeSkewness        time.Duration
 	idleTimeout                 time.Duration
 	handshakeTimeout            time.Duration
@@ -241,18 +243,23 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	p.registerConn(ctx)
 	defer p.unregisterConn(ctx)
 
-	clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
-	if err != nil {
-		ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
-		return
-	}
-	defer clientConn.Stop()
+	// FakeTLS specifics: the doppelganger wrapper and a separate obfuscated2
+	// handshake inside the unwrapped TLS stream. A secured client has already
+	// done its obfuscated2 handshake in doSecuredHandshake.
+	if !ctx.secured {
+		clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
+		if err != nil {
+			ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
+			return
+		}
+		defer clientConn.Stop()
 
-	ctx.clientConn = clientConn
+		ctx.clientConn = clientConn
 
-	if err := p.doObfuscatedHandshake(ctx); err != nil {
-		ctx.logger.InfoError("obfuscated handshake is failed", err)
-		return
+		if err := p.doObfuscatedHandshake(ctx); err != nil {
+			ctx.logger.InfoError("obfuscated handshake is failed", err)
+			return
+		}
 	}
 
 	if err := ctx.clientConn.SetDeadline(time.Time{}); err != nil {
@@ -566,6 +573,33 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		secretKeys[i] = set.secrets[i].Key[:]
 	}
 
+	if p.securedEnabled {
+		// Classify the transport before invoking a parser. A TLS ClientHello with
+		// an invalid HMAC is an active probe and must reach the mask host byte for
+		// byte; parsing its first 64 bytes as a secured handshake would consume and
+		// corrupt the fallback stream.
+		firstBytes := [5]byte{}
+		if _, err := io.ReadFull(rewind, firstBytes[:]); err != nil {
+			ctx.logger.InfoError("cannot read initial handshake bytes", err)
+			p.doDomainFrontingForHost(ctx, rewind, set.secrets[0].Host)
+
+			return false
+		}
+
+		rewind.Rewind()
+
+		if !isFakeTLSHandshake(firstBytes) {
+			if frontHost, err := p.doSecuredHandshake(ctx, rewind, set, secretKeys); err != nil {
+				ctx.logger.InfoError("cannot process secured handshake", err)
+				p.doDomainFrontingForHost(ctx, rewind, frontHost)
+
+				return false
+			}
+
+			return true
+		}
+	}
+
 	result, err := fake.ReadClientHelloMulti(
 		rewind,
 		secretKeys,
@@ -621,6 +655,64 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	ctx.clientConn = tls.New(ctx.clientConn, true, false)
 
 	return true
+}
+
+// isFakeTLSHandshake reports whether the first bytes look like a TLS 1.x
+// ClientHello record (handshake type, version 3.1), which is what FakeTLS
+// clients send.
+func isFakeTLSHandshake(firstBytes [5]byte) bool {
+	return firstBytes[0] == tls.TypeHandshake &&
+		firstBytes[1] == 3 &&
+		firstBytes[2] == 1
+}
+
+// doSecuredHandshake handles a secured ("dd") client: plain obfuscated2
+// without FakeTLS. The secret is found by trying the keys of all secrets in
+// set against the handshake frame (dd and ee secrets share the key).
+//
+// A matched client is subject to exactly the same per-user rules as a FakeTLS
+// one: the replay check, the governance limits (disabled, expired, over
+// quota) and the advertising tag. Limits are checked before the replay buffer
+// is committed, so a denied client is relayed to the fronting host with its
+// original bytes, like a wrong secret. On error the returned host is the one
+// to front to.
+func (p *Proxy) doSecuredHandshake(ctx *streamContext, rewind *connRewind, set *secretSet, secretKeys [][]byte) (string, error) {
+	rewind.Rewind()
+
+	idx, dcIdx, cn, replayKey, err := obfuscation.ReadHandshakeMulti(rewind, secretKeys)
+	if err != nil {
+		return set.secrets[0].Host, err
+	}
+
+	frontHost := set.secrets[idx].Host
+
+	if p.antiReplayCache.SeenBefore(replayKey) {
+		p.logger.Warning("replay attack has been detected (secured)!")
+		p.eventStream.Send(p.ctx, NewEventReplayAttack(ctx.streamID))
+
+		return frontHost, errors.New("replay attack has been detected")
+	}
+
+	if allowed, reason := p.checkLimits(set.names[idx], set.limits[idx]); !allowed {
+		ctx.logger.BindStr("secret_name", set.names[idx]).
+			BindStr("deny_reason", reason.String()).
+			Info("secured connection denied by per-user limit; routing to fronting")
+
+		return frontHost, fmt.Errorf("connection denied by per-user limit: %s", reason)
+	}
+
+	// Authenticated and allowed: stop recording the stream for replay.
+	rewind.Commit()
+
+	ctx.secured = true
+	ctx.dc = dcIdx
+	ctx.clientConn = cn
+	ctx.matchedSecretKey = set.secrets[idx].Key[:]
+	ctx.secretName = set.names[idx]
+	ctx.adTag = set.effectiveAdTag(idx)
+	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName).BindInt("dc", dcIdx)
+
+	return frontHost, nil
 }
 
 func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
@@ -757,7 +849,9 @@ func (p *Proxy) doMiddleProxyCall(ctx *streamContext) error {
 
 func (p *Proxy) doDomainFrontingForHost(ctx *streamContext, conn *connRewind, host string) {
 	p.eventStream.Send(p.ctx, NewEventDomainFronting(ctx.streamID))
-	conn.Rewind()
+	// No more protocol detection after this point: replay the recorded bytes
+	// once and stop recording.
+	conn.FinalRewind()
 
 	nativeDialer := p.network.NativeDialer()
 	fConn, err := nativeDialer.DialContext(ctx, "tcp", p.domainFrontingAddressForHost(host))
@@ -840,6 +934,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		idleTimeout:              opts.getIdleTimeout(),
 		handshakeTimeout:         opts.getHandshakeTimeout(),
 		allowFallbackOnUnknownDC: opts.AllowFallbackOnUnknownDC,
+		securedEnabled:           opts.SecuredEnabled,
 		telegram:                 tg,
 		doppelGanger: doppel.NewGanger(
 			ctx,

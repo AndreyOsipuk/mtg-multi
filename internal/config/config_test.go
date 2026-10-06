@@ -200,6 +200,19 @@ func (suite *ConfigTestSuite) TestParseMinimalNoAdTag() {
 	suite.Equal("", conf.GetAPIToken())
 }
 
+func (suite *ConfigTestSuite) TestSecuredDisabledByDefault() {
+	conf, err := config.Parse(suite.ReadConfig("minimal.toml"))
+	suite.NoError(err)
+	suite.False(conf.Secured.Enabled.Get(false))
+}
+
+func (suite *ConfigTestSuite) TestSecured() {
+	conf, err := config.Parse(suite.ReadConfig("secured.toml"))
+	suite.NoError(err)
+	suite.NoError(conf.Validate())
+	suite.True(conf.Secured.Enabled.Get(false))
+}
+
 func TestConfig(t *testing.T) {
 	t.Parallel()
 	suite.Run(t, &ConfigTestSuite{})
