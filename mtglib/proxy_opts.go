@@ -223,6 +223,12 @@ type ProxyOpts struct {
 	// This is an optional setting.
 	DCPoolSize uint
 
+	// DCPoolDCs is the list of DC ids to keep warm connections to; negative
+	// ids are media DCs. Defaults to DefaultDCPoolDCs.
+	//
+	// This is an optional setting.
+	DCPoolDCs []int
+
 	// DDShapeEnabled masks the first server-to-client response for secured
 	// connections with a random delay and fragmentation.
 	//
@@ -361,6 +367,14 @@ func (p ProxyOpts) getThrottleCheckInterval() time.Duration {
 	}
 
 	return p.ThrottleCheckInterval
+}
+
+func (p ProxyOpts) getDCPoolDCs() []int {
+	if len(p.DCPoolDCs) == 0 {
+		return DefaultDCPoolDCs
+	}
+
+	return p.DCPoolDCs
 }
 
 func (p ProxyOpts) getDCPoolSize() int {

@@ -361,3 +361,39 @@ func TestProbeAlive(t *testing.T) {
 		}
 	})
 }
+
+// Media DCs (negative ids) and the CDN DC 203 are pooled like regular ones:
+// on our nodes most traffic goes there, and before they always missed.
+func TestDCPoolWarmsMediaAndCDNDCs(t *testing.T) {
+	for _, dcID := range []int{-2, 203} {
+		dial := func(_ context.Context, id int) (essentials.Conn, dc.Addr, int, error) {
+			return &fakePoolConn{}, testAddr(), id, nil
+		}
+
+		p := newTestPool(dial, 1, 20*time.Second)
+		p.topUp(context.Background(), dcID)
+
+		if _, _, ok := p.get(dcID); !ok {
+			t.Fatalf("dc %d: expected a warm connection", dcID)
+		}
+	}
+}
+
+func TestDefaultDCPoolDCsFollowTraffic(t *testing.T) {
+	want := map[int]bool{2: true, -2: true, 203: true}
+	for _, id := range DefaultDCPoolDCs {
+		delete(want, id)
+	}
+
+	if len(want) != 0 {
+		t.Fatalf("default warm DCs must include media DC 2 and CDN DC 203, missing %v", want)
+	}
+
+	if (ProxyOpts{}).getDCPoolDCs()[0] != DefaultDCPoolDCs[0] {
+		t.Fatal("empty DCPoolDCs must fall back to the default")
+	}
+
+	if got := (ProxyOpts{DCPoolDCs: []int{5}}).getDCPoolDCs(); len(got) != 1 || got[0] != 5 {
+		t.Fatalf("explicit DCPoolDCs must be used, got %v", got)
+	}
+}

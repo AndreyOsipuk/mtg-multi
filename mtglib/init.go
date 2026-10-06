@@ -136,10 +136,12 @@ const (
 	DefaultDDShapeFragBytes = 88
 )
 
-// dcPoolWarmDCs is the list of Telegram DC ids the warm pool keeps connections
-// to. Telegram has 5 DCs; any of them can serve any client, so warming all of
-// them covers whichever DC a client requests.
-var dcPoolWarmDCs = []int{1, 2, 3, 4, 5}
+// DefaultDCPoolDCs is the list of Telegram DC ids the warm pool keeps
+// connections to by default. It follows real traffic, not the DC numbering:
+// on our nodes almost everything goes to media DC 2 (-2), CDN DC 203 and DC 2,
+// then DC 4 and its media counterpart. Warming DC 1..5 instead produced ~9
+// warm dials per useful hit, and media/CDN requests always missed (06.10.2026).
+var DefaultDCPoolDCs = []int{2, -2, 203, 4, -4}
 
 // Network defines a knowledge how to work with a network. It may sound fun but
 // it encapsulates all the knowledge how to properly establish connections to

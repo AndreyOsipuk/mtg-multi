@@ -342,6 +342,8 @@ func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyc
 		// MTG_DC_POOL_SIZE=N задаёт число тёплых коннектов на DC.
 		DCPoolEnabled: !strings.EqualFold(os.Getenv("MTG_DC_POOL"), "off"),
 		DCPoolSize:    envUint("MTG_DC_POOL_SIZE"),
+		// MTG_DC_POOL_DCS=2,-2,203 - какие DC прогревать (отрицательные - медиа).
+		DCPoolDCs: envInts("MTG_DC_POOL_DCS"),
 
 		// Mask the first secured server response with delay and fragmentation.
 		// Enable explicitly with MTG_DD_SHAPE=on.
@@ -435,4 +437,18 @@ func envUint(name string) uint {
 	}
 
 	return uint(v)
+}
+
+// envInts парсит список целых через запятую из ENV; мусорные элементы
+// пропускаются, пусто → nil (вызывающий подставит дефолт).
+func envInts(name string) []int {
+	var out []int
+
+	for _, part := range strings.Split(os.Getenv(name), ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(part)); err == nil && n != 0 {
+			out = append(out, n)
+		}
+	}
+
+	return out
 }

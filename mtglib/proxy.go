@@ -660,7 +660,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 			func(dcID int, result string) {
 				proxy.eventStream.Send(proxy.ctx, NewEventDCPool(dcID, result))
 			},
-			dcPoolWarmDCs,
+			opts.getDCPoolDCs(),
 			opts.getDCPoolSize(),
 			DCPoolConnMaxAge,
 			DCPoolRefreshInterval,
