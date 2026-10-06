@@ -1,6 +1,6 @@
 module github.com/dolonet/mtg-multi
 
-go 1.26.4
+go 1.26.8
 
 require (
 	github.com/OneOfOne/xxhash v1.2.8
