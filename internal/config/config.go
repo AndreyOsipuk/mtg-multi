@@ -98,6 +98,11 @@ type Config struct {
 		MaxConnections TypeConcurrency `json:"maxConnections"`
 		CheckInterval  TypeDuration    `json:"checkInterval"`
 	} `json:"throttle"`
+	DCPool struct {
+		Optional
+
+		Size TypeConcurrency `json:"size"`
+	} `json:"dcPool"`
 	Stats struct {
 		StatsD struct {
 			Optional

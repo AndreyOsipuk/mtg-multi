@@ -70,6 +70,18 @@ func (m multiObserver) EventFinish(evt mtglib.EventFinish) {
 	wg.Wait()
 }
 
+func (m multiObserver) EventDCPool(evt mtglib.EventDCPool) {
+	wg := &sync.WaitGroup{}
+
+	for _, v := range m.observers {
+		wg.Go(func() {
+			v.EventDCPool(evt)
+		})
+	}
+
+	wg.Wait()
+}
+
 func (m multiObserver) EventConcurrencyLimited(evt mtglib.EventConcurrencyLimited) {
 	wg := &sync.WaitGroup{}
 

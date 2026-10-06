@@ -88,6 +88,10 @@ type tomlConfig struct {
 		MaxConnections uint   `toml:"max-connections" json:"maxConnections,omitempty"`
 		CheckInterval  string `toml:"check-interval" json:"checkInterval,omitempty"`
 	} `toml:"throttle" json:"throttle"`
+	DCPool struct {
+		Enabled bool `toml:"enabled" json:"enabled,omitempty"`
+		Size    uint `toml:"size" json:"size,omitempty"`
+	} `toml:"dc-pool" json:"dcPool"`
 	Stats struct {
 		StatsD struct {
 			Enabled      bool   `toml:"enabled" json:"enabled,omitempty"`

@@ -155,6 +155,19 @@ func (suite *PrometheusTestSuite) TestEventConcurrencyLimited() {
 	suite.Contains(data, `mtg_concurrency_limited 1`)
 }
 
+func (suite *PrometheusTestSuite) TestEventDCPool() {
+	suite.prometheus.EventDCPool(mtglib.NewEventDCPool(2, mtglib.DCPoolResultHit))
+	suite.prometheus.EventDCPool(mtglib.NewEventDCPool(2, mtglib.DCPoolResultHit))
+	suite.prometheus.EventDCPool(mtglib.NewEventDCPool(4, mtglib.DCPoolResultDead))
+
+	time.Sleep(100 * time.Millisecond)
+
+	data, err := suite.Get()
+	suite.NoError(err)
+	suite.Contains(data, `mtg_dc_pool{dc="2",result="hit"} 2`)
+	suite.Contains(data, `mtg_dc_pool{dc="4",result="dead"} 1`)
+}
+
 func (suite *PrometheusTestSuite) TestEventIPBlocklisted() {
 	suite.prometheus.EventIPBlocklisted(
 		mtglib.NewEventIPBlocklisted(net.ParseIP("2001:db8::68")),

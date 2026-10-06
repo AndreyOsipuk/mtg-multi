@@ -126,6 +126,12 @@ func (s statsdProcessor) EventReplayAttack(_ mtglib.EventReplayAttack) {
 	s.client.Incr(MetricReplayAttacks, 1)
 }
 
+func (s statsdProcessor) EventDCPool(evt mtglib.EventDCPool) {
+	s.client.Incr(MetricDCPool, 1,
+		statsd.IntTag(TagDC, evt.DC),
+		statsd.StringTag(TagDCPoolResult, evt.Result))
+}
+
 func (s statsdProcessor) EventIPListSize(evt mtglib.EventIPListSize) {
 	tag := TagIPListBlock
 	if !evt.IsBlockList {

@@ -47,6 +47,9 @@ type Observer interface {
 	// mtglib.EventConcurrencyLimited event.
 	EventConcurrencyLimited(mtglib.EventConcurrencyLimited)
 
+	// EventDCPool reacts on incoming mtglib.EventDCPool event.
+	EventDCPool(mtglib.EventDCPool)
+
 	// EventIPBlocklisted reacts on incoming mtglib.EventIPBlocklisted event.
 	EventIPBlocklisted(mtglib.EventIPBlocklisted)
 

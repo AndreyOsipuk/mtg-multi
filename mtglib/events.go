@@ -165,6 +165,30 @@ func NewEventDomainFronting(streamID string) EventDomainFronting {
 	}
 }
 
+// EventDCPool is emitted on warm DC pool activity: a client got a warm
+// connection (hit), had to dial cold (miss), a pooled connection turned out
+// stale or dead, a background filler refreshed or failed to refresh the pool.
+type EventDCPool struct {
+	eventBase
+
+	// DC is a Telegram DC the pool works with.
+	DC int
+
+	// Result is one of DCPoolResult* values.
+	Result string
+}
+
+// NewEventDCPool creates a new EventDCPool event.
+func NewEventDCPool(dc int, result string) EventDCPool {
+	return EventDCPool{
+		eventBase: eventBase{
+			timestamp: time.Now(),
+		},
+		DC:     dc,
+		Result: result,
+	}
+}
+
 // NewEventConcurrencyLimited creates a new EventConcurrencyLimited
 // event.
 func NewEventConcurrencyLimited() EventConcurrencyLimited {

@@ -411,6 +411,9 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 
 		ThrottleMaxConnections: conf.Throttle.MaxConnections.Get(0),
 		ThrottleCheckInterval:  conf.Throttle.CheckInterval.Get(5 * time.Second),
+
+		DCPoolEnabled: conf.DCPool.Enabled.Get(false),
+		DCPoolSize:    conf.DCPool.Size.Get(0),
 	}
 
 	proxy, err := mtglib.NewProxy(opts)

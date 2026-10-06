@@ -156,6 +156,7 @@ type Proxy struct {
 	telegram                    *dc.Telegram
 	configUpdater               *dc.PublicConfigUpdater
 	doppelGanger                *doppel.Ganger
+	dcPool                      *dcPool
 
 	middleProxy    *middleproxy.Manager
 	ourIPv4        net.IP
@@ -335,6 +336,10 @@ func (p *Proxy) Shutdown() {
 
 	p.allowlist.Shutdown()
 	p.blocklist.Shutdown()
+
+	if p.dcPool != nil {
+		p.dcPool.Shutdown()
+	}
 
 	if p.usageStateFile != "" {
 		if err := p.stats.FlushUsage(p.usageStateFile); err != nil {
@@ -675,11 +680,42 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 
 	dcid := ctx.dc
 
-	addresses := p.telegram.GetAddresses(dcid)
-	if len(addresses) == 0 && p.allowFallbackOnUnknownDC {
+	// Warm pool (direct path only): if there is a ready connection to this DC,
+	// use it and skip the cold dial and handshake. Ad-tagged streams never get
+	// here unless the middle proxy failed above.
+	if p.dcPool != nil {
+		if conn, addr, ok := p.dcPool.get(dcid); ok {
+			p.attachTelegramConn(ctx, conn, addr)
+
+			return nil
+		}
+	}
+
+	conn, foundAddr, actualDC, err := p.dialAndHandshake(ctx, dcid)
+	if err != nil {
+		return err
+	}
+
+	if actualDC != dcid {
 		ctx.logger = ctx.logger.BindInt("original_dc", dcid)
 		ctx.logger.Warning("unknown DC, fallbacks")
-		ctx.dc = dc.DefaultDC
+		ctx.dc = actualDC
+	}
+
+	p.attachTelegramConn(ctx, conn, foundAddr)
+
+	return nil
+}
+
+// dialAndHandshake dials dcID and performs the obfuscated2 handshake. It
+// returns the handshaked connection (ready to relay), the chosen address and
+// the actual DC (it may differ from the requested one with
+// AllowFallbackOnUnknownDC). It does not touch streamContext, so both the
+// client path and the dcPool fillers (which have no stream) use it.
+func (p *Proxy) dialAndHandshake(ctx context.Context, dcID int) (essentials.Conn, dc.Addr, int, error) {
+	addresses := p.telegram.GetAddresses(dcID)
+	if len(addresses) == 0 && p.allowFallbackOnUnknownDC {
+		dcID = dc.DefaultDC
 		addresses = p.telegram.GetAddresses(dc.DefaultDC)
 	}
 
@@ -690,42 +726,43 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 	)
 
 	for _, addr := range addresses {
-		conn, err = p.network.Dial(addr.Network, addr.Address)
+		conn, err = p.network.DialContext(ctx, addr.Network, addr.Address)
 		if err == nil {
 			foundAddr = addr
 			break
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("no addresses to call: %w", err)
+		return nil, dc.Addr{}, 0, fmt.Errorf("no addresses to call: %w", err)
 	}
 	if conn == nil {
-		return fmt.Errorf("no available addresses for DC %d", ctx.dc)
+		return nil, dc.Addr{}, 0, fmt.Errorf("no available addresses for DC %d", dcID)
 	}
 
-	tgConn, err := foundAddr.Obfuscator.SendHandshake(conn, ctx.dc)
+	tgConn, err := foundAddr.Obfuscator.SendHandshake(conn, dcID)
 	if err != nil {
 		conn.Close() // nolint: errcheck
-		return fmt.Errorf("cannot perform server handshake: %w", err)
+
+		return nil, dc.Addr{}, 0, fmt.Errorf("cannot perform server handshake: %w", err)
 	}
 
-	ctx.telegramConn = p.wrapTraffic(tgConn, ctx)
+	return tgConn, foundAddr, dcID, nil
+}
 
-	telegramHost, _, err := net.SplitHostPort(foundAddr.Address)
-	if err != nil {
-		conn.Close() //nolint: errcheck
+// attachTelegramConn puts a ready (dialed and handshaked) DC connection on the
+// stream and emits EventConnectedToDC. Shared tail of the cold dial and the
+// warm pool paths.
+func (p *Proxy) attachTelegramConn(ctx *streamContext, conn essentials.Conn, addr dc.Addr) {
+	ctx.telegramConn = p.wrapTraffic(conn, ctx)
 
-		return fmt.Errorf("cannot parse telegram address %s: %w", foundAddr.Address, err)
+	if telegramHost, _, err := net.SplitHostPort(addr.Address); err == nil {
+		p.eventStream.Send(
+			ctx,
+			NewEventConnectedToDC(ctx.streamID,
+				net.ParseIP(telegramHost),
+				ctx.dc),
+		)
 	}
-
-	p.eventStream.Send(
-		ctx,
-		NewEventConnectedToDC(ctx.streamID,
-			net.ParseIP(telegramHost),
-			ctx.dc),
-	)
-
-	return nil
 }
 
 // doMiddleProxyCall dials a Telegram middle proxy for the stream's DC and sets
@@ -898,6 +935,25 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	if opts.AutoUpdate {
 		proxy.configUpdater.Run(ctx, dc.PublicConfigUpdateURLv4, "tcp4")
 		proxy.configUpdater.Run(ctx, dc.PublicConfigUpdateURLv6, "tcp6")
+	}
+
+	// Warm DC connection pool, opt-in. Fillers start right away and retry until
+	// AutoUpdate brings DC addresses; clients are never blocked by it (a miss
+	// falls back to a cold dial). The pool only serves the direct path: streams
+	// routed through a middle proxy (adtag) do not use it.
+	if opts.DCPoolEnabled {
+		proxy.dcPool = newDCPool(
+			ctx,
+			proxy.dialAndHandshake,
+			logger.Named("dc-pool"),
+			func(dcID int, result string) {
+				proxy.eventStream.Send(proxy.ctx, NewEventDCPool(dcID, result))
+			},
+			dcPoolWarmDCs,
+			opts.getDCPoolSize(),
+			DCPoolConnMaxAge,
+			DCPoolRefreshInterval,
+		)
 	}
 
 	pool, err := ants.NewPoolWithFunc(opts.getConcurrency(),
