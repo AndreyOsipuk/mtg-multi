@@ -446,16 +446,31 @@ func runProxy(
 		go watchReload(ctx, reloadSignals, readConfig, updater, logger.Named("reload"))
 	}
 
+	return waitAndShutdown(ctx, serveErr, func() {
+		listener.Close() //nolint: errcheck
+		proxy.Shutdown()
+	})
+}
+
+// waitAndShutdown ждёт остановки, останавливает прокси и решает, была ли это
+// авария. Serve, упавший сам, кладёт ошибку в канал до cancel(), поэтому к
+// моменту ctx.Done() она уже там. При обычной остановке (SIGTERM) Serve ещё
+// работает, и ошибку, которую он вернёт из-за закрытого в stop listener, не
+// считаем аварией - иначе каждый systemctl stop/restart заканчивался кодом 1.
+func waitAndShutdown(ctx context.Context, serveErr <-chan error, stop func()) error {
 	<-ctx.Done()
-	listener.Close() //nolint: errcheck
-	proxy.Shutdown()
+
+	var serveFailure error
 
 	select {
-	case err := <-serveErr:
-		if err != nil {
-			return fmt.Errorf("proxy stopped accepting connections: %w", err)
-		}
+	case serveFailure = <-serveErr:
 	default:
+	}
+
+	stop()
+
+	if serveFailure != nil {
+		return fmt.Errorf("proxy stopped accepting connections: %w", serveFailure)
 	}
 
 	return nil
