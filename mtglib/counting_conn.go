@@ -12,14 +12,17 @@ type countingConn struct {
 	st *secretStats
 }
 
-func newCountingConn(conn essentials.Conn, stats *ProxyStats, secretName string) *countingConn {
-	return &countingConn{Conn: conn, st: stats.getOrCreate(secretName)}
+// st is the stats entry the session is accounted in (streamContext.userStats).
+// It is not looked up by name again, so a removed secret is never recreated.
+func newCountingConn(conn essentials.Conn, st *secretStats) *countingConn {
+	return &countingConn{Conn: conn, st: st}
 }
 
 func (c *countingConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
 		c.st.bytesIn.Add(int64(n))
+		c.st.quotaUsed.Add(int64(n))
 	}
 
 	return n, err
@@ -29,6 +32,7 @@ func (c *countingConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	if n > 0 {
 		c.st.bytesOut.Add(int64(n))
+		c.st.quotaUsed.Add(int64(n))
 	}
 
 	return n, err

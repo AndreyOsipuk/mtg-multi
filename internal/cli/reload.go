@@ -10,14 +10,48 @@ import (
 	"github.com/dolonet/mtg-multi/web"
 )
 
-type secretsUpdater interface {
-	UpdateSecrets(secrets map[string]mtglib.Secret) (mtglib.SecretsUpdate, error)
+// secretsApplier - единая точка применения набора секретов в прокси
+// (mtglib.Proxy.ApplySecrets). Через неё идут и SIGHUP, и POST /reload, и
+// PUT /secrets от панели.
+type secretsApplier interface {
+	ApplySecrets(cfg mtglib.SecretConfig) (mtglib.SecretsUpdate, error)
 }
 
-// reloadSecrets re-reads the configuration and applies its secrets to a
-// running proxy. Other options are not reloaded. On any error the current
-// secrets are kept.
-func reloadSecrets(readConfig func() (*config.Config, error), proxy secretsUpdater, logger mtglib.Logger) error {
+// secretConfigOf - всё, что меняется на лету: секреты, рекламные теги и
+// лимиты ([secret-limits]). Остальные опции конфига перезагрузкой не
+// применяются.
+func secretConfigOf(conf *config.Config) mtglib.SecretConfig {
+	return mtglib.SecretConfig{
+		Secrets:      conf.GetSecrets(),
+		SecretAdTags: conf.GetSecretAdTags(),
+		GlobalAdTag:  conf.GetAdTag(),
+		Limits:       conf.GetSecretLimits(),
+	}
+}
+
+// makeSecretsReloader builds the callback Proxy.ReloadSecrets uses to re-read
+// the secret set on a POST /reload. It re-reads the same config as SIGHUP
+// (readConfig), so both entry points see the same file and overlay. It returns
+// nil when there is no config file (simple-run), leaving reload unsupported.
+func makeSecretsReloader(readConfig func() (*config.Config, error)) func() (mtglib.SecretConfig, error) {
+	if readConfig == nil {
+		return nil
+	}
+
+	return func() (mtglib.SecretConfig, error) {
+		conf, err := readConfig()
+		if err != nil {
+			return mtglib.SecretConfig{}, err
+		}
+
+		return secretConfigOf(conf), nil
+	}
+}
+
+// reloadSecrets re-reads the configuration and applies its secrets, tags and
+// limits to a running proxy. Other options are not reloaded. On any error the
+// current secrets are kept.
+func reloadSecrets(readConfig func() (*config.Config, error), proxy secretsApplier, logger mtglib.Logger) error {
 	conf, err := readConfig()
 	if err != nil {
 		logger.WarningError("reload: cannot read config, keeping current secrets", err)
@@ -25,7 +59,7 @@ func reloadSecrets(readConfig func() (*config.Config, error), proxy secretsUpdat
 		return err
 	}
 
-	update, err := proxy.UpdateSecrets(conf.GetSecrets())
+	update, err := proxy.ApplySecrets(secretConfigOf(conf))
 	if err != nil {
 		logger.WarningError("reload: cannot apply secrets, keeping current secrets", err)
 
@@ -49,7 +83,7 @@ func watchReload(
 	ctx context.Context,
 	signals <-chan os.Signal,
 	readConfig func() (*config.Config, error),
-	proxy secretsUpdater,
+	proxy secretsApplier,
 	logger mtglib.Logger,
 ) {
 	for {
@@ -67,32 +101,19 @@ type webSecretsUpdater interface {
 	UpdateSecrets(secrets map[string][]byte) error
 }
 
-// webProxyUpdater применяет секреты и к прокси, и к WEB-входу. WEB идёт первым:
-// его таблицы сначала целиком строятся и проверяются, и при ошибке прокси не
-// трогаем - обе стороны остаются на прежнем списке.
-type webProxyUpdater struct {
-	proxy secretsUpdater
-	web   webSecretsUpdater
-}
-
-func (u webProxyUpdater) UpdateSecrets(secrets map[string]mtglib.Secret) (mtglib.SecretsUpdate, error) {
-	// Те же проверки, что в Proxy.UpdateSecrets, - до WEB: иначе WEB ушёл бы на
-	// новый список, а прокси отказал и остался на старом.
-	if len(secrets) == 0 {
-		return mtglib.SecretsUpdate{}, mtglib.ErrSecretEmpty
-	}
-
-	for name, secret := range secrets {
-		if !secret.Valid() {
-			return mtglib.SecretsUpdate{}, fmt.Errorf("invalid secret %q", name)
+// webSecretsHook - хук для Proxy.SetSecretsHook: прокси вызывает его при
+// любом применении (SIGHUP, POST /reload, PUT /secrets) после проверок и до
+// подмены своего набора. WEB идёт первым: его таблицы сначала целиком
+// строятся и проверяются, и при ошибке прокси не трогаем - обе стороны
+// остаются на прежнем списке.
+func webSecretsHook(w webSecretsUpdater) func(map[string]mtglib.Secret) error {
+	return func(secrets map[string]mtglib.Secret) error {
+		if err := w.UpdateSecrets(webSecrets(secrets)); err != nil {
+			return fmt.Errorf("web: %w", err)
 		}
-	}
 
-	if err := u.web.UpdateSecrets(webSecrets(secrets)); err != nil {
-		return mtglib.SecretsUpdate{}, fmt.Errorf("web: %w", err)
+		return nil
 	}
-
-	return u.proxy.UpdateSecrets(secrets) //nolint: wrapcheck
 }
 
 // webSecrets - ключи секретов в виде, который ждёт пакет web.
@@ -109,3 +130,5 @@ func webSecrets(secrets map[string]mtglib.Secret) map[string][]byte {
 }
 
 var _ webSecretsUpdater = (*web.Server)(nil)
+
+var _ secretsApplier = (*mtglib.Proxy)(nil)

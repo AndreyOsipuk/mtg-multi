@@ -248,6 +248,21 @@ func warnSNIMismatch(conf *config.Config, ntw mtglib.Network, log mtglib.Logger)
 	}
 }
 
+// warnIgnoredOfficialEnvs flags environment variables of the official
+// telegrammessenger/proxy image that mtg-multi intentionally does not
+// implement, so migrating users are not left guessing why they had no effect.
+// SECRET and TAG (and the MTG_-prefixed variants) are honored — see
+// config.ApplyEnvironment.
+func warnIgnoredOfficialEnvs(log mtglib.Logger) {
+	if _, ok := os.LookupEnv("WORKERS"); ok {
+		log.Warning("WORKERS environment variable is ignored: mtg-multi is a single Go process that already uses all CPU cores")
+	}
+
+	if _, ok := os.LookupEnv("SECRET_COUNT"); ok {
+		log.Warning("SECRET_COUNT environment variable is ignored: define named secrets in the [secrets] config section or via the management API")
+	}
+}
+
 func warnDeprecatedDomainFronting(conf *config.Config, log mtglib.Logger) {
 	if conf.DomainFrontingIP.Value != nil {
 		log.Warning(`config option "domain-fronting-ip" is deprecated and ignored; use "host" in [domain-fronting] instead`)
@@ -271,6 +286,7 @@ func runProxy(
 
 	logger.BindJSON("configuration", conf.String()).Debug("configuration")
 
+	warnIgnoredOfficialEnvs(logger)
 	warnDeprecatedDomainFronting(conf, logger)
 
 	eventStream, err := makeEventStream(conf, logger)
@@ -340,22 +356,31 @@ func runProxy(
 		DoppelGangerEach:    conf.Defense.Doppelganger.UpdateEach.Get(mtglib.DoppelGangerEach),
 		DoppelGangerDRS:     conf.Defense.Doppelganger.DRS.Get(false),
 
-		APIBindTo: conf.APIBindTo.Get(""),
+		APIBindTo:       conf.APIBindTo.Get(""),
+		APIToken:        conf.GetAPIToken(),
+		SecretsReloader: makeSecretsReloader(readConfig),
+
+		GlobalAdTag:    conf.GetAdTag(),
+		SecretAdTags:   conf.GetSecretAdTags(),
+		SecretLimits:   conf.GetSecretLimits(),
+		UsageStateFile: conf.UsageStateFile,
+		EmitTraffic:    conf.Stats.StatsD.Enabled.Get(false) || conf.Stats.Prometheus.Enabled.Get(false),
+		PublicIPv4:     conf.PublicIPv4.Get(nil),
+		PublicIPv6:     conf.PublicIPv6.Get(nil),
+		AdvertisedPort: int(conf.GetFirstBindPort()),
 
 		ThrottleMaxConnections: conf.Throttle.MaxConnections.Get(0),
 		ThrottleCheckInterval:  conf.Throttle.CheckInterval.Get(5 * time.Second),
 
-		// Тёплый пул коннектов к DC включён по умолчанию; kill-switch через ENV
-		// (config.toml не трогаем — он генерится ботом). MTG_DC_POOL=off отключает,
-		// MTG_DC_POOL_SIZE=N задаёт число тёплых коннектов на DC.
-		DCPoolEnabled: !strings.EqualFold(os.Getenv("MTG_DC_POOL"), "off"),
-		DCPoolSize:    envUint("MTG_DC_POOL_SIZE"),
-		// MTG_DC_POOL_DCS=2,-2,203 - какие DC прогревать (отрицательные - медиа).
-		DCPoolDCs: envInts("MTG_DC_POOL_DCS"),
-
-		// Mask the first secured server response with delay and fragmentation.
-		// Enable explicitly with MTG_DD_SHAPE=on.
-		DDShapeEnabled: strings.EqualFold(os.Getenv("MTG_DD_SHAPE"), "on"),
+		// Наши возможности: раздел конфига > окружение > умолчание (см.
+		// features.go). MTG_DC_POOL=off, MTG_SECURED=off выключают,
+		// MTG_DC_POOL_SIZE=N, MTG_DC_POOL_DCS=2,-2,203 настраивают пул,
+		// MTG_DD_SHAPE=on включает шейпинг первого dd-ответа.
+		DCPoolEnabled:   dcPoolEnabled(conf),
+		DCPoolSize:      dcPoolSize(conf),
+		DCPoolDCs:       dcPoolDCs(conf),
+		SecuredDisabled: !securedEnabled(conf),
+		DDShapeEnabled:  ddShapeEnabled(conf),
 	}
 
 	proxy, err := mtglib.NewProxy(opts)
@@ -382,6 +407,12 @@ func runProxy(
 
 		if webServer != nil {
 			defer webServer.Close()
+
+			// WEB-профили обновляются при любом применении секретов: SIGHUP,
+			// POST /reload и PUT /secrets идут через один механизм прокси.
+			if err := proxy.SetSecretsHook(webSecretsHook(webServer)); err != nil {
+				return fmt.Errorf("cannot sync web mode secrets: %w", err)
+			}
 
 			go func() {
 				if err := web.Serve(webServer, webBind); err != nil {
@@ -438,12 +469,7 @@ func runProxy(
 	}()
 
 	if readConfig != nil {
-		var updater secretsUpdater = proxy
-		if webServer != nil {
-			updater = webProxyUpdater{proxy: proxy, web: webServer}
-		}
-
-		go watchReload(ctx, reloadSignals, readConfig, updater, logger.Named("reload"))
+		go watchReload(ctx, reloadSignals, readConfig, proxy, logger.Named("reload"))
 	}
 
 	return waitAndShutdown(ctx, serveErr, func() {

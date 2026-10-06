@@ -28,6 +28,7 @@ type streamContext struct {
 	dc               int
 	matchedSecretKey []byte
 	secretName       string
+	adTag            *[AdTagLength]byte
 	// secured=true — клиент подключился через secured-режим (dd-секрет,
 	// obfuscated2 без FakeTLS-обёртки). В этом случае obfuscated2-рукопожатие уже
 	// сделано внутри doSecuredHandshake, и ServeConn пропускает FakeTLS-специфику

@@ -3,14 +3,20 @@ package mtglib
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net"
+	"maps"
 	"net/http"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// usageFlushInterval is how often persisted quota usage is written to disk and
+// monthly quota periods are rolled over for display freshness.
+const usageFlushInterval = 30 * time.Second
 
 type secretStats struct {
 	connections atomic.Int64
@@ -20,6 +26,40 @@ type secretStats struct {
 
 	ipsMu sync.Mutex
 	ips   map[string]int
+
+	// quotaUsed counts bytes against the current quota period (client read +
+	// write). It is incremented by countingConn, reset by a monthly rollover or
+	// an explicit ResetQuota, and persisted across restarts. Unlike
+	// bytesIn/bytesOut it is not a lifetime display counter.
+	quotaUsed atomic.Int64
+
+	// periodStart is the unix-nano start of the current quota period, used to
+	// detect monthly rollovers. 0 means "not started yet".
+	periodStart atomic.Int64
+}
+
+// rolloverIfNeeded zeroes quotaUsed when the monthly quota period has elapsed.
+// It is a no-op for any reset policy other than monthly. The first call for a
+// monthly secret simply anchors the period start. Concurrent callers race
+// harmlessly: a compare-and-swap ensures only one performs the reset.
+func (st *secretStats) rolloverIfNeeded(reset QuotaReset, now time.Time) {
+	if reset != QuotaResetMonthly {
+		return
+	}
+
+	startNano := st.periodStart.Load()
+	if startNano == 0 {
+		st.periodStart.CompareAndSwap(0, now.UnixNano())
+
+		return
+	}
+
+	start := time.Unix(0, startNano)
+	if now.Year() != start.Year() || now.Month() != start.Month() {
+		if st.periodStart.CompareAndSwap(startNano, now.UnixNano()) {
+			st.quotaUsed.Store(0)
+		}
+	}
 }
 
 // ProxyStats tracks per-secret connection stats with atomic counters.
@@ -175,6 +215,118 @@ func (s *ProxyStats) UpdateLastSeen(name string) {
 	}
 }
 
+// QuotaUsed returns the bytes counted against the secret's current quota period,
+// rolling the monthly period over first when it is due.
+//
+// A forgotten secret is not recreated: it has no usage.
+func (s *ProxyStats) QuotaUsed(name string, reset QuotaReset) int64 {
+	st := s.lookup(name)
+	if st == nil {
+		return 0
+	}
+
+	st.rolloverIfNeeded(reset, time.Now())
+
+	return st.quotaUsed.Load()
+}
+
+// quotaUsedValue returns the raw used-bytes counter without a rollover. It is
+// used for display, where the periodic loop and connection gate keep the value
+// fresh.
+func (s *ProxyStats) quotaUsedValue(name string) int64 {
+	s.mu.RLock()
+	st, ok := s.users[name]
+	s.mu.RUnlock()
+
+	if !ok {
+		return 0
+	}
+
+	return st.quotaUsed.Load()
+}
+
+// rollover applies a monthly quota rollover for a single secret if it is due.
+func (s *ProxyStats) rollover(name string, reset QuotaReset, now time.Time) {
+	if st := s.lookup(name); st != nil {
+		st.rolloverIfNeeded(reset, now)
+	}
+}
+
+// ResetQuota zeroes the used-bytes counter for the secret and restarts its quota
+// period from now.
+func (s *ProxyStats) ResetQuota(name string) {
+	st := s.lookup(name)
+	if st == nil {
+		return
+	}
+
+	st.quotaUsed.Store(0)
+	st.periodStart.Store(time.Now().UnixNano())
+}
+
+// usageRecord is the persisted per-secret quota state.
+type usageRecord struct {
+	QuotaUsed   int64 `json:"quota_used"`
+	PeriodStart int64 `json:"period_start"`
+}
+
+// LoadUsage restores persisted quota usage from path. A missing file is not an
+// error (there is simply nothing to restore yet).
+func (s *ProxyStats) LoadUsage(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		return fmt.Errorf("cannot read usage state %s: %w", path, err)
+	}
+
+	var records map[string]usageRecord
+	if err := json.Unmarshal(data, &records); err != nil {
+		return fmt.Errorf("cannot parse usage state %s: %w", path, err)
+	}
+
+	for name, rec := range records {
+		st := s.getOrCreate(name)
+		st.quotaUsed.Store(rec.QuotaUsed)
+		st.periodStart.Store(rec.PeriodStart)
+	}
+
+	return nil
+}
+
+// FlushUsage writes the current quota usage of every known secret to path
+// atomically (write-temp-then-rename), so a crash never leaves a truncated file.
+func (s *ProxyStats) FlushUsage(path string) error {
+	s.mu.RLock()
+	records := make(map[string]usageRecord, len(s.users))
+
+	for name, st := range s.users {
+		records[name] = usageRecord{
+			QuotaUsed:   st.quotaUsed.Load(),
+			PeriodStart: st.periodStart.Load(),
+		}
+	}
+	s.mu.RUnlock()
+
+	data, err := json.Marshal(records)
+	if err != nil {
+		return fmt.Errorf("cannot marshal usage state: %w", err)
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil { //nolint: mnd
+		return fmt.Errorf("cannot write usage state %s: %w", tmp, err)
+	}
+
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("cannot replace usage state %s: %w", path, err)
+	}
+
+	return nil
+}
+
 // SetThrottle configures connection throttling. Must be called before
 // startThrottleLoop and before any connections arrive.
 func (s *ProxyStats) SetThrottle(limit int64, interval time.Duration) {
@@ -275,9 +427,7 @@ func computeFairCaps(userConns map[string]int64, limit int64) map[string]int64 {
 	}
 
 	remaining := make(map[string]int64, len(userConns))
-	for k, v := range userConns {
-		remaining[k] = v
-	}
+	maps.Copy(remaining, userConns)
 
 	budget := limit
 	caps := make(map[string]int64)
@@ -325,18 +475,30 @@ type ThrottleJSON struct {
 	Caps   map[string]int64 `json:"caps,omitempty"`
 }
 
-// UserStatsJSON is the per-user portion of the stats JSON response.
+// UserStatsJSON is the per-user portion of the stats JSON response. The quota
+// and expiry fields describe the secret's configured limits and are filled in by
+// the proxy (which holds the secret snapshot); ProxyStats itself only fills the
+// runtime counters, including QuotaUsed.
 type UserStatsJSON struct {
 	Connections int64      `json:"connections"`
 	BytesIn     int64      `json:"bytes_in"`
 	BytesOut    int64      `json:"bytes_out"`
 	LastSeen    *time.Time `json:"last_seen"`
 	ActiveIPs   []string   `json:"active_ips"`
+
+	QuotaUsed      int64      `json:"quota_used"`
+	Quota          int64      `json:"quota,omitempty"`
+	QuotaRemaining *int64     `json:"quota_remaining,omitempty"`
+	QuotaReset     string     `json:"quota_reset,omitempty"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+	Disabled       bool       `json:"disabled,omitempty"`
 }
 
-func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// buildResponse assembles the base stats response (runtime counters, active
+// client IPs, throttle state and the secrets digest). Per-secret limit fields
+// are left zero for the proxy to overlay.
+func (s *ProxyStats) buildResponse() StatsResponse {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	var totalConns int64
 
@@ -366,8 +528,10 @@ func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			BytesOut:    st.bytesOut.Load(),
 			LastSeen:    lastSeenPtr,
 			ActiveIPs:   activeIPs,
+			QuotaUsed:   st.quotaUsed.Load(),
 		}
 	}
+	s.mu.RUnlock()
 
 	var throttle *ThrottleJSON
 	if s.throttleLimit > 0 {
@@ -377,9 +541,7 @@ func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var capsCopy map[string]int64
 		if len(s.throttleCaps) > 0 {
 			capsCopy = make(map[string]int64, len(s.throttleCaps))
-			for k, v := range s.throttleCaps {
-				capsCopy[k] = v
-			}
+			maps.Copy(capsCopy, s.throttleCaps)
 		}
 
 		s.throttleMu.RUnlock()
@@ -403,44 +565,50 @@ func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		resp.SecretsSHA256 = digest
 	}
 
+	return resp
+}
+
+func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
+	if err := json.NewEncoder(w).Encode(s.buildResponse()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-// StartServer starts an HTTP server for the stats API in a background goroutine.
-// The server is shut down when ctx is cancelled.
-func (s *ProxyStats) StartServer(ctx context.Context, bindTo string, logger Logger) {
-	mux := http.NewServeMux()
-	mux.Handle("/stats", s)
+// The management HTTP API (GET /stats, POST /reload, /secrets and /adtag
+// routes) is served by (*Proxy).startAPIServer in proxy_api.go, which builds a
+// mux with access to the whole proxy. reloadHandler below is shared by that
+// server for the /reload route.
 
-	srv := &http.Server{
-		Addr:    bindTo,
-		Handler: mux,
-	}
+// reloadHandler answers POST /reload by running reload and reporting the
+// outcome: 200 on success, 405 for a non-POST, 503 when the proxy has no
+// reloader wired, and 500 when the reload itself fails (the previous secret
+// set stays active). A nil reload is treated as unavailable.
+func reloadHandler(reload func() error, logger Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "only POST is allowed", http.StatusMethodNotAllowed)
 
-	ln, err := net.Listen("tcp", bindTo)
-	if err != nil {
-		logger.WarningError("cannot start stats API listener", err)
-		return
-	}
-
-	go func() {
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			logger.WarningError("stats API server error", err)
+			return
 		}
-	}()
 
-	go func() {
-		<-ctx.Done()
+		if reload == nil {
+			http.Error(w, "reload is not supported", http.StatusServiceUnavailable)
 
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second) //nolint: mnd
-		defer cancel()
+			return
+		}
 
-		srv.Shutdown(shutdownCtx) //nolint: errcheck
-	}()
+		if err := reload(); err != nil {
+			logger.WarningError("secret reload failed", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 
-	logger.BindStr("bind", bindTo).Info("Stats API server started")
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}` + "\n")) //nolint: errcheck
+	}
 }

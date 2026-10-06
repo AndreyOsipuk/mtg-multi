@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -26,9 +28,10 @@ import (
 type ProxyTestSuite struct {
 	suite.Suite
 
-	opts     *mtglib.ProxyOpts
-	p        *mtglib.Proxy
-	listener net.Listener
+	opts        *mtglib.ProxyOpts
+	p           *mtglib.Proxy
+	listener    net.Listener
+	frontServer *httptest.Server
 }
 
 func (suite *ProxyTestSuite) ProxyAddress() string {
@@ -62,15 +65,32 @@ func (suite *ProxyTestSuite) SetupSuite() {
 
 	go allowlist.Run(time.Second)
 
+	// A local stand-in for the fronting domain (httpbin.org) so the test
+	// does not depend on external network availability.
+	suite.frontServer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]map[string]string{ //nolint: errcheck
+			"headers": {"X-Amzn-Trace-Id": "Root=1-mtg-test"},
+		})
+	}))
+
+	frontHost, frontPortStr, err := net.SplitHostPort(suite.frontServer.Listener.Addr().String())
+	suite.Require().NoError(err)
+
+	frontPort, err := strconv.ParseUint(frontPortStr, 10, 16)
+	suite.Require().NoError(err)
+
 	suite.opts = &mtglib.ProxyOpts{
-		Secret:          mtglib.GenerateSecret("httpbin.org"),
-		Network:         ntw,
-		AntiReplayCache: antireplay.NewNoop(),
-		IPBlocklist:     ipblocklist.NewNoop(),
-		IPAllowlist:     allowlist,
-		EventStream:     events.NewNoopStream(),
-		Logger:          logger.NewNoopLogger(),
-		UseTestDCs:      true,
+		Secret:             mtglib.GenerateSecret("httpbin.org"),
+		Network:            ntw,
+		AntiReplayCache:    antireplay.NewNoop(),
+		IPBlocklist:        ipblocklist.NewNoop(),
+		IPAllowlist:        allowlist,
+		EventStream:        events.NewNoopStream(),
+		Logger:             logger.NewNoopLogger(),
+		UseTestDCs:         true,
+		DomainFrontingHost: frontHost,
+		DomainFrontingPort: uint(frontPort),
 	}
 
 	proxy, err := mtglib.NewProxy(*suite.opts)
@@ -93,6 +113,10 @@ func (suite *ProxyTestSuite) TearDownSuite() {
 
 	if suite.p != nil {
 		suite.p.Shutdown()
+	}
+
+	if suite.frontServer != nil {
+		suite.frontServer.Close()
 	}
 }
 
@@ -161,7 +185,7 @@ func (suite *ProxyTestSuite) TestCannotInitIncorrectPreferIP() {
 }
 
 func (suite *ProxyTestSuite) TestDomainFrontingAddress() {
-	suite.Equal("httpbin.org:443", suite.p.DomainFrontingAddress())
+	suite.Equal(suite.frontServer.Listener.Addr().String(), suite.p.DomainFrontingAddress())
 }
 
 func (suite *ProxyTestSuite) TestHTTPSRequest() {

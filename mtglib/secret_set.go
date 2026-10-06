@@ -10,40 +10,86 @@ import (
 )
 
 // secretSet is an immutable snapshot of the configured secrets. The proxy
-// swaps it atomically on UpdateSecrets, so a handshake always works with one
-// consistent snapshot.
+// swaps it atomically on every update (SIGHUP, POST /reload, the management
+// API), so a handshake always works with one consistent snapshot. secrets,
+// names, keys, adTags and limits stay index-aligned: secrets[i] belongs to
+// names[i]; hostnames is the deduplicated, sorted set of secret hosts used for
+// SNI matching.
 type secretSet struct {
 	secrets   []Secret
 	names     []string
 	hostnames []string
 	keys      [][]byte
 	byName    map[string]Secret
+
+	// adTags[i] is the per-secret advertising tag override for secrets[i], or
+	// nil when that secret has no override; globalAdTag applies to any secret
+	// without an override, or nil when no advertising is configured.
+	adTags      []*[AdTagLength]byte
+	globalAdTag *[AdTagLength]byte
+	// limits[i] holds the governance limits (quota, expiry, disabled) for
+	// secrets[i]; the zero value means the secret is unrestricted.
+	limits []SecretLimits
 }
 
+// newSecretSet builds a snapshot of plain secrets without advertising tags and
+// limits.
 func newSecretSet(secrets map[string]Secret) *secretSet {
-	names := make([]string, 0, len(secrets))
-	for name := range secrets {
+	return buildSecretSet(secrets, nil, nil, nil)
+}
+
+// newSecretSetFromConfig builds a snapshot of a full SecretConfig.
+func newSecretSetFromConfig(cfg SecretConfig) *secretSet {
+	return buildSecretSet(cfg.Secrets, cfg.SecretAdTags, cfg.GlobalAdTag, cfg.Limits)
+}
+
+// buildSecretSet turns a name->secret map into an immutable, name-sorted
+// snapshot. Sorting keeps names[i] and secrets[i] aligned and makes the
+// matched index stable across processes for a given secret map. perSecret
+// carries optional per-name advertising tags and global is the fallback tag;
+// both may be nil. limitsMap carries optional per-name governance limits and
+// may be nil.
+func buildSecretSet(
+	secretsMap map[string]Secret,
+	perSecret map[string][AdTagLength]byte,
+	global *[AdTagLength]byte,
+	limitsMap map[string]SecretLimits,
+) *secretSet {
+	names := make([]string, 0, len(secretsMap))
+	for name := range secretsMap {
 		names = append(names, name)
 	}
 
 	sort.Strings(names)
 
 	set := &secretSet{
-		secrets: make([]Secret, 0, len(names)),
-		names:   names,
-		keys:    make([][]byte, 0, len(names)),
-		byName:  make(map[string]Secret, len(names)),
+		secrets:     make([]Secret, 0, len(names)),
+		names:       names,
+		keys:        make([][]byte, 0, len(names)),
+		byName:      make(map[string]Secret, len(names)),
+		adTags:      make([]*[AdTagLength]byte, len(names)),
+		globalAdTag: global,
+		limits:      make([]SecretLimits, len(names)),
 	}
 
 	// Collect unique hostnames across all secrets for SNI matching.
 	hostnameSet := make(map[string]struct{}, len(names))
 
-	for _, name := range names {
-		secret := secrets[name]
+	for i, name := range names {
+		secret := secretsMap[name]
 		set.secrets = append(set.secrets, secret)
 		set.keys = append(set.keys, secret.Key[:])
 		set.byName[name] = secret
 		hostnameSet[secret.Host] = struct{}{}
+
+		if tag, ok := perSecret[name]; ok {
+			t := tag
+			set.adTags[i] = &t
+		}
+
+		if lim, ok := limitsMap[name]; ok {
+			set.limits[i] = lim
+		}
 	}
 
 	set.hostnames = make([]string, 0, len(hostnameSet))
@@ -54,6 +100,61 @@ func newSecretSet(secrets map[string]Secret) *secretSet {
 	sort.Strings(set.hostnames)
 
 	return set
+}
+
+// effectiveAdTag returns the advertising tag that applies to secrets[i]: the
+// per-secret override if present, otherwise the global tag, otherwise nil (the
+// direct-DC path).
+func (s *secretSet) effectiveAdTag(i int) *[AdTagLength]byte {
+	if i < len(s.adTags) && s.adTags[i] != nil {
+		return s.adTags[i]
+	}
+
+	return s.globalAdTag
+}
+
+// limitsOf returns the governance limits of a secret by name; an unknown name
+// has no limits.
+func (s *secretSet) limitsOf(name string) SecretLimits {
+	idx := sort.SearchStrings(s.names, name)
+	if idx < len(s.names) && s.names[idx] == name && idx < len(s.limits) {
+		return s.limits[idx]
+	}
+
+	return SecretLimits{}
+}
+
+// toConfig reconstructs a mutable SecretConfig from the immutable snapshot. It
+// is the copy-on-write starting point for the management-API mutators, which
+// apply a delta and swap the result back in.
+func (s *secretSet) toConfig() SecretConfig {
+	secrets := make(map[string]Secret, len(s.names))
+
+	var perSecret map[string][AdTagLength]byte
+
+	var limits map[string]SecretLimits
+
+	for i, name := range s.names {
+		secrets[name] = s.secrets[i]
+
+		if s.adTags[i] != nil {
+			if perSecret == nil {
+				perSecret = make(map[string][AdTagLength]byte)
+			}
+
+			perSecret[name] = *s.adTags[i]
+		}
+
+		if i < len(s.limits) && !s.limits[i].IsZero() {
+			if limits == nil {
+				limits = make(map[string]SecretLimits)
+			}
+
+			limits[name] = s.limits[i]
+		}
+	}
+
+	return SecretConfig{Secrets: secrets, SecretAdTags: perSecret, GlobalAdTag: s.globalAdTag, Limits: limits}
 }
 
 // digest - sha256 от строк "имя=секрет(hex)" в порядке имён через \n. Синк
@@ -80,7 +181,7 @@ func (s *secretSet) sameSecret(name string, key []byte) bool {
 	return ok && bytes.Equal(secret.Key[:], key)
 }
 
-// SecretsUpdate describes the result of Proxy.UpdateSecrets.
+// SecretsUpdate describes the result of applying a new secret set.
 type SecretsUpdate struct {
 	// Added is the number of new secret names.
 	Added int
@@ -90,7 +191,8 @@ type SecretsUpdate struct {
 	// host.
 	Changed int
 	// ClosedSessions is the number of live sessions that were closed because
-	// their secret was removed or changed.
+	// their secret was removed or changed, or because it is now disabled or
+	// expired.
 	ClosedSessions int
 }
 
@@ -107,6 +209,7 @@ func newSessionRegistry() *sessionRegistry {
 	}
 }
 
+// add registers a session. The caller must hold r.mu.
 func (r *sessionRegistry) add(ctx *streamContext) {
 	byName := r.sessions[ctx.secretName]
 	if byName == nil {

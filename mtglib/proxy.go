@@ -14,6 +14,7 @@ import (
 	"github.com/dolonet/mtg-multi/essentials"
 	"github.com/dolonet/mtg-multi/mtglib/internal/dc"
 	"github.com/dolonet/mtg-multi/mtglib/internal/doppel"
+	"github.com/dolonet/mtg-multi/mtglib/internal/middleproxy"
 	"github.com/dolonet/mtg-multi/mtglib/internal/relay"
 	"github.com/dolonet/mtg-multi/mtglib/internal/tls"
 	"github.com/dolonet/mtg-multi/mtglib/internal/tls/fake"
@@ -40,14 +41,36 @@ type Proxy struct {
 	doppelGanger                *doppel.Ganger
 	dcPool                      *dcPool
 
+	middleProxy    *middleproxy.Manager
+	ourIPv4        net.IP
+	ourIPv6        net.IP
+	advertisedPort int
+
+	usageStateFile string
+	emitTraffic    bool
+
+	// securedDisabled выключает приём secured (dd): всё, что не FakeTLS,
+	// уходит на маскировку.
+	securedDisabled   bool
 	ddShapeEnabled    bool
 	ddShapeDelayMinMs int
 	ddShapeDelayMaxMs int
 	ddShapeFragBytes  int
 
-	stats           *ProxyStats
-	secretSet       atomic.Pointer[secretSet]
-	sessions        *sessionRegistry
+	stats   *ProxyStats
+	secrets atomic.Pointer[secretSet]
+	// sessions - аутентифицированные сессии по именам секретов. Регистрация
+	// сессии (trackSession) и подмена набора (applySecretConfigLocked) идут под
+	// одной блокировкой sessions.mu: рукопожатие, начатое на старом наборе, не
+	// проходит после удаления или смены ключа.
+	sessions *sessionRegistry
+	reloader func() (SecretConfig, error)
+	// reloadMu упорядочивает все изменения набора секретов: SIGHUP, POST
+	// /reload, PUT/POST/DELETE /secrets, /adtag.
+	reloadMu sync.Mutex
+	// secretsHook вызывается под reloadMu до подмены набора (WEB-вход). Ошибка
+	// отменяет применение целиком.
+	secretsHook     func(map[string]Secret) error
 	network         Network
 	antiReplayCache AntiReplayCache
 	blocklist       IPBlocklist
@@ -61,7 +84,7 @@ type Proxy struct {
 // instead of the secret's hostname. When secrets use different hostnames,
 // pass the matched secret's host to front the correct domain.
 func (p *Proxy) DomainFrontingAddress() string {
-	return p.domainFrontingAddressForHost(p.secretSet.Load().secrets[0].Host)
+	return p.domainFrontingAddressForHost(p.secrets.Load().secrets[0].Host)
 }
 
 func (p *Proxy) domainFrontingAddressForHost(host string) string {
@@ -111,7 +134,7 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	}
 
 	if !p.trackSession(ctx) {
-		ctx.logger.Info("secret was removed or changed during handshake")
+		ctx.logger.Info("secret was removed, changed or denied during handshake")
 		return
 	}
 	defer p.sessions.remove(ctx)
@@ -170,7 +193,7 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 		ctx,
 		ctx.logger.Named("relay"),
 		connIdleTimeout{Conn: ctx.telegramConn, tracker: tracker},
-		newCountingConn(connIdleTimeout{Conn: ctx.clientConn, tracker: tracker}, p.stats, ctx.secretName),
+		newCountingConn(connIdleTimeout{Conn: ctx.clientConn, tracker: tracker}, ctx.userStats),
 	)
 }
 
@@ -267,11 +290,342 @@ func (p *Proxy) Shutdown() {
 
 	p.allowlist.Shutdown()
 	p.blocklist.Shutdown()
+
+	if p.usageStateFile != "" {
+		if err := p.stats.FlushUsage(p.usageStateFile); err != nil {
+			p.logger.WarningError("cannot flush usage state on shutdown", err)
+		}
+	}
+}
+
+// ReloadSecrets re-reads the secret set through the configured reloader and
+// applies it, so a client add, removal, disable or re-key takes effect without
+// restarting the process. It is the POST /reload entry point; SIGHUP goes
+// through ApplySecrets with the same re-read configuration, and both end in
+// applySecretConfigLocked. It returns ErrReloaderNotConfigured when the proxy
+// was built without a SecretsReloader, and an error (leaving the current set
+// active) when the reloader fails or yields no valid secret.
+func (p *Proxy) ReloadSecrets() error {
+	if p.reloader == nil {
+		return ErrReloaderNotConfigured
+	}
+
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
+	cfg, err := p.reloader()
+	if err != nil {
+		return fmt.Errorf("cannot reload secrets: %w", err)
+	}
+
+	return p.swapSecretConfigLocked(cfg)
+}
+
+// ApplySecrets replaces the whole secret configuration (secrets, advertising
+// tags, limits) without restarting the proxy.
+//
+// New handshakes use the new set right away. Live sessions of secrets that
+// are kept unchanged continue to work; sessions of removed secrets, of
+// secrets whose key or host has changed and of secrets that are now disabled
+// or expired are closed. Other options (bind addresses, domain fronting,
+// defense settings) are not affected.
+func (p *Proxy) ApplySecrets(cfg SecretConfig) (SecretsUpdate, error) {
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
+	return p.applySecretConfigLocked(cfg)
+}
+
+// UpdateSecrets replaces only the set of secrets. Advertising tags and limits
+// of the names that are kept stay as they are; those of removed names are
+// dropped.
+func (p *Proxy) UpdateSecrets(secrets map[string]Secret) (SecretsUpdate, error) {
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
+	cfg := p.secrets.Load().toConfig()
+	cfg.Secrets = secrets
+
+	for name := range cfg.SecretAdTags {
+		if _, ok := secrets[name]; !ok {
+			delete(cfg.SecretAdTags, name)
+		}
+	}
+
+	for name := range cfg.Limits {
+		if _, ok := secrets[name]; !ok {
+			delete(cfg.Limits, name)
+		}
+	}
+
+	return p.applySecretConfigLocked(cfg)
+}
+
+// SetSecretsHook registers fn to be called with every new secret set before
+// it is applied (for example, to rebuild WEB-mode profiles). An error from fn
+// aborts the update and keeps the current set everywhere. fn is called right
+// away with the current set, so the hook owner starts in sync even if an
+// update has happened between NewProxy and this call.
+func (p *Proxy) SetSecretsHook(fn func(map[string]Secret) error) error {
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
+	if fn != nil {
+		if err := fn(p.secrets.Load().toConfig().Secrets); err != nil {
+			return err
+		}
+	}
+
+	p.secretsHook = fn
+
+	return nil
+}
+
+// swapSecretConfigLocked is applySecretConfigLocked for callers that need
+// only the error. The caller MUST hold reloadMu.
+func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
+	_, err := p.applySecretConfigLocked(cfg)
+
+	return err
+}
+
+// applySecretConfigLocked - единственная точка смены набора секретов: SIGHUP,
+// POST /reload и все мутаторы API приходят сюда. Порядок:
+//
+//  1. проверки - до любых побочных эффектов;
+//  2. хук (WEB-вход): его таблицы строятся первыми, при ошибке прокси не
+//     трогаем - обе стороны остаются на прежнем списке;
+//  3. подмена набора, отпечатка и сбор сессий на закрытие - под sessions.mu,
+//     той же блокировкой, под которой регистрируется сессия (trackSession);
+//  4. закрытие сессий через исходное соединение (closeFromOutside).
+//
+// Вызывающий ОБЯЗАН держать reloadMu.
+func (p *Proxy) applySecretConfigLocked(cfg SecretConfig) (SecretsUpdate, error) {
+	update := SecretsUpdate{}
+
+	if len(cfg.Secrets) == 0 {
+		return update, fmt.Errorf("%w: %w", ErrSecretEmpty, ErrSecretInvalid)
+	}
+
+	for name, secret := range cfg.Secrets {
+		if !secret.Valid() {
+			return update, fmt.Errorf("%w: invalid secret %q", ErrSecretInvalid, name)
+		}
+	}
+
+	if p.secretsHook != nil {
+		if err := p.secretsHook(cfg.Secrets); err != nil {
+			return update, fmt.Errorf("cannot apply secrets to hook: %w", err)
+		}
+	}
+
+	next := newSecretSetFromConfig(cfg)
+
+	for _, name := range next.names {
+		p.stats.PreRegister(name)
+	}
+
+	toClose := []*streamContext{}
+	gone := []string{}
+
+	p.sessions.mu.Lock()
+
+	prev := p.secrets.Swap(next)
+	p.stats.SetSecretsDigest(next.digest())
+
+	if prev != nil {
+		for _, name := range prev.names {
+			newSecret, ok := next.byName[name]
+
+			switch {
+			case !ok:
+				update.Removed++
+				gone = append(gone, name)
+			case newSecret != prev.byName[name]:
+				update.Changed++
+			default:
+				continue
+			}
+
+			for ctx := range p.sessions.sessions[name] {
+				toClose = append(toClose, ctx)
+			}
+
+			delete(p.sessions.sessions, name)
+		}
+	}
+
+	// Сессии оставшихся пользователей, которых теперь запрещают лимиты
+	// (выключен или истёк срок). Превышение квоты живые сессии не рвёт - как и
+	// throttle, оно действует только на новые соединения.
+	for name, sessions := range p.sessions.sessions {
+		if p.deniedNow(next.limitsOf(name)) {
+			for ctx := range sessions {
+				toClose = append(toClose, ctx)
+			}
+
+			delete(p.sessions.sessions, name)
+		}
+	}
+
+	for _, name := range gone {
+		p.stats.Forget(name)
+	}
+
+	p.sessions.mu.Unlock()
+
+	for _, name := range next.names {
+		if prev == nil {
+			update.Added++
+
+			continue
+		}
+
+		if _, ok := prev.byName[name]; !ok {
+			update.Added++
+		}
+	}
+
+	for _, ctx := range toClose {
+		ctx.closeFromOutside()
+	}
+
+	update.ClosedSessions = len(toClose)
+
+	return update, nil
+}
+
+// trackSession registers an authenticated session and counts it in the stats.
+// It fails if the secret the session has authenticated with was removed or
+// changed after the handshake had started, or is now disabled or expired.
+// Both happen under the registry lock, so a concurrent update either sees the
+// session and closes it, or the session is rejected; the stats of a removed
+// secret are never recreated.
+func (p *Proxy) trackSession(ctx *streamContext) bool {
+	p.sessions.mu.Lock()
+	defer p.sessions.mu.Unlock()
+
+	set := p.secrets.Load()
+
+	if !set.sameSecret(ctx.secretName, ctx.matchedSecretKey) {
+		return false
+	}
+
+	if p.deniedNow(set.limitsOf(ctx.secretName)) {
+		return false
+	}
+
+	p.sessions.add(ctx)
+	ctx.userStats = p.stats.getOrCreate(ctx.secretName)
+	ctx.userStats.connections.Add(1)
+
+	return true
+}
+
+// deniedNow reports whether limits forbid a secret right now regardless of its
+// traffic: it is disabled or has expired.
+func (p *Proxy) deniedNow(lim SecretLimits) bool {
+	if lim.Disabled {
+		return true
+	}
+
+	return !lim.ExpiresAt.IsZero() && !time.Now().Before(lim.ExpiresAt)
+}
+
+// checkLimits reports whether a new connection for the named secret is allowed
+// by its governance limits, combining the snapshot limit (disabled flag, expiry
+// deadline, quota ceiling) with the live usage counter held in stats. The
+// returned DenyReason is DenyNone when allowed.
+func (p *Proxy) checkLimits(name string, lim SecretLimits) (bool, DenyReason) {
+	if lim.Disabled {
+		return false, DenyDisabled
+	}
+
+	if !lim.ExpiresAt.IsZero() && !time.Now().Before(lim.ExpiresAt) {
+		return false, DenyExpired
+	}
+
+	if lim.QuotaBytes > 0 && p.stats.QuotaUsed(name, lim.QuotaReset) >= lim.QuotaBytes {
+		return false, DenyQuota
+	}
+
+	return true, DenyNone
+}
+
+// closeDeniedConns closes every live stream whose secret is now denied because
+// it was disabled or has expired, so such a change takes effect immediately
+// instead of only blocking new connections. A quota overrun does not close
+// live streams — consistent with the throttle, existing connections are never
+// killed mid-flight. applySecretConfigLocked does the same as a part of every
+// update; this is for a check outside of an update.
+func (p *Proxy) closeDeniedConns() int {
+	set := p.secrets.Load()
+
+	var denied []*streamContext
+
+	p.sessions.mu.Lock()
+	for name, sessions := range p.sessions.sessions {
+		if !p.deniedNow(set.limitsOf(name)) {
+			continue
+		}
+
+		for sc := range sessions {
+			denied = append(denied, sc)
+		}
+
+		delete(p.sessions.sessions, name)
+	}
+	p.sessions.mu.Unlock()
+
+	for _, sc := range denied {
+		sc.closeFromOutside()
+	}
+
+	return len(denied)
+}
+
+// rolloverAllQuotas applies a monthly quota rollover to every secret whose
+// policy is monthly, keeping the persisted and displayed usage fresh even for
+// secrets that no client is currently hitting.
+func (p *Proxy) rolloverAllQuotas() {
+	set := p.secrets.Load()
+	now := time.Now()
+
+	for i, name := range set.names {
+		if set.limits[i].QuotaReset == QuotaResetMonthly {
+			p.stats.rollover(name, set.limits[i].QuotaReset, now)
+		}
+	}
+}
+
+// startUsagePersistence periodically rolls quota periods over and flushes the
+// usage counters to usageStateFile until ctx is cancelled.
+func (p *Proxy) startUsagePersistence(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(usageFlushInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				p.rolloverAllQuotas()
+
+				if err := p.stats.FlushUsage(p.usageStateFile); err != nil {
+					p.logger.WarningError("cannot flush usage state", err)
+				}
+			}
+		}
+	}()
 }
 
 func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	rewind := newConnRewind(ctx.clientConn)
-	set := p.secretSet.Load()
+
+	// Read the active secret snapshot once so a concurrent update cannot
+	// desync the key list, hostnames and matched index mid-handshake.
+	set := p.secrets.Load()
 
 	// Classify the transport before invoking a parser. In particular, a TLS
 	// ClientHello with an invalid HMAC is an active probe and must be forwarded
@@ -287,6 +641,13 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	rewind.Rewind()
 
 	if !isFakeTLSHandshake(firstBytes) {
+		if p.securedDisabled {
+			ctx.logger.Info("not a FakeTLS handshake and secured mode is disabled")
+			p.doDomainFrontingForHost(ctx, rewind, set.secrets[0].Host)
+
+			return false
+		}
+
 		ok, err := p.doSecuredHandshake(ctx, rewind, set)
 		if ok {
 			return true
@@ -328,7 +689,19 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	matchedSecret := set.secrets[result.MatchedIndex]
 	ctx.matchedSecretKey = matchedSecret.Key[:]
 	ctx.secretName = set.names[result.MatchedIndex]
+	ctx.adTag = set.effectiveAdTag(result.MatchedIndex)
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName)
+
+	// Enforce per-user governance limits before we speak TLS back. A denied
+	// user (disabled, expired, or over quota) is routed to the cover site just
+	// like a wrong secret, so the outcome is indistinguishable to a prober.
+	if allowed, reason := p.checkLimits(ctx.secretName, set.limits[result.MatchedIndex]); !allowed {
+		ctx.logger.BindStr("deny_reason", reason.String()).
+			Info("connection denied by per-user limit; routing to fronting")
+		p.doDomainFrontingForHost(ctx, rewind, result.MatchedHost)
+
+		return false
+	}
 
 	gangerNoise := p.doppelGanger.NoiseParams()
 	noiseParams := fake.NoiseParams{Mean: gangerNoise.Mean, Jitter: gangerNoise.Jitter}
@@ -353,6 +726,9 @@ func isFakeTLSHandshake(firstBytes [5]byte) bool {
 // напрямую, без FakeTLS. Матчинг по 16б-ключу — конфиг остаётся ee, ключ у dd и
 // ee один и тот же. true = распознан и настроен; ServeConn дальше пропускает
 // FakeTLS-специфику (doppelganger + отдельный doObfuscatedHandshake).
+//
+// Лимиты пользователя (выключен, истёк, квота) проверяются до Commit: отказ
+// уходит на маскировку так же, как неверный ключ.
 func (p *Proxy) doSecuredHandshake(ctx *streamContext, rewind *connRewind, set *secretSet) (bool, error) {
 	rewind.Rewind()
 
@@ -368,12 +744,17 @@ func (p *Proxy) doSecuredHandshake(ctx *streamContext, rewind *connRewind, set *
 		return false, errors.New("replay attack has been detected")
 	}
 
+	if allowed, reason := p.checkLimits(set.names[idx], set.limits[idx]); !allowed {
+		return false, fmt.Errorf("connection denied by per-user limit: %s", reason.String())
+	}
+
 	rewind.Commit()
 	ctx.secured = true
 	ctx.dc = dcIdx
 	ctx.clientConn = cn
 	ctx.matchedSecretKey = set.secrets[idx].Key[:]
 	ctx.secretName = set.names[idx]
+	ctx.adTag = set.effectiveAdTag(idx)
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName).BindInt("dc", dcIdx)
 
 	return true, nil
@@ -397,7 +778,38 @@ func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
 	return nil
 }
 
+// wrapTraffic wraps conn so per-read/write byte counts are emitted as
+// EventTraffic, but only when a metrics observer is configured (emitTraffic).
+// EventTraffic is consumed solely by the statsd/prometheus observers, so when
+// none is enabled the wrapper is skipped entirely — avoiding a heap allocation
+// (plus time.Now, a streamID hash and a channel send) on every relay read and
+// write.
+func (p *Proxy) wrapTraffic(conn essentials.Conn, ctx *streamContext) essentials.Conn {
+	if !p.emitTraffic {
+		return conn
+	}
+
+	return connTraffic{
+		Conn:     conn,
+		streamID: ctx.streamID,
+		stream:   p.eventStream,
+		ctx:      ctx,
+	}
+}
+
 func (p *Proxy) doTelegramCall(ctx *streamContext) error {
+	// When this stream carries an advertising tag, route it through a Telegram
+	// middle proxy so a sponsored channel appears. On any failure we log and
+	// fall through to the direct path so the client stays online (availability
+	// is favored over the sponsored channel).
+	if ctx.adTag != nil && p.middleProxy != nil {
+		if err := p.doMiddleProxyCall(ctx); err != nil {
+			ctx.logger.WarningError("cannot route through middle proxy, using direct connection", err)
+		} else {
+			return nil
+		}
+	}
+
 	dcid := ctx.dc
 
 	// Тёплый пул: если есть готовый коннект к нужному DC — берём его, минуя
@@ -422,6 +834,33 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 	}
 
 	p.attachTelegramConn(ctx, conn, foundAddr)
+
+	return nil
+}
+
+// doMiddleProxyCall dials a Telegram middle proxy for the stream's DC and sets
+// ctx.telegramConn to an RPC stream that carries the client's traffic together
+// with the advertising tag. It returns an error (leaving ctx.telegramConn
+// unset) if the middle proxy cannot be reached, so the caller can fall back to
+// a direct connection.
+func (p *Proxy) doMiddleProxyCall(ctx *streamContext) error {
+	clientAddr, _ := ctx.clientConn.RemoteAddr().(*net.TCPAddr)
+
+	stream, middleIP, err := p.middleProxy.DialProxyStream(p.network, middleproxy.DialParams{
+		DC:             ctx.dc,
+		ClientAddr:     clientAddr,
+		PublicIPv4:     p.ourIPv4,
+		PublicIPv6:     p.ourIPv6,
+		AdvertisedPort: p.advertisedPort,
+		AdTag:          *ctx.adTag,
+	})
+	if err != nil {
+		return fmt.Errorf("cannot dial middle proxy: %w", err)
+	}
+
+	ctx.telegramConn = p.wrapTraffic(stream, ctx)
+
+	p.eventStream.Send(ctx, NewEventConnectedToDC(ctx.streamID, middleIP, ctx.dc))
 
 	return nil
 }
@@ -481,12 +920,7 @@ func (p *Proxy) dialAndHandshake(ctx context.Context, dcID int) (essentials.Conn
 // streamContext и шлёт событие ConnectedToDC. Общий хвост для холодного dial и
 // тёплого пула.
 func (p *Proxy) attachTelegramConn(ctx *streamContext, conn essentials.Conn, addr dc.Addr) {
-	ctx.telegramConn = connTraffic{
-		Conn:     conn,
-		streamID: ctx.streamID,
-		stream:   p.eventStream,
-		ctx:      ctx,
-	}
+	ctx.telegramConn = p.wrapTraffic(conn, ctx)
 
 	if telegramHost, _, err := net.SplitHostPort(addr.Address); err == nil {
 		p.eventStream.Send(
@@ -516,12 +950,7 @@ func (p *Proxy) doDomainFrontingForHost(ctx *streamContext, conn *connRewind, ho
 		frontConn = newConnProxyProtocol(ctx.clientConn, frontConn)
 	}
 
-	frontConn = connTraffic{
-		Conn:     frontConn,
-		ctx:      ctx,
-		streamID: ctx.streamID,
-		stream:   p.eventStream,
-	}
+	frontConn = p.wrapTraffic(frontConn, ctx)
 
 	tracker := newIdleTracker(p.idleTimeout)
 
@@ -534,7 +963,7 @@ func (p *Proxy) doDomainFrontingForHost(ctx *streamContext, conn *connRewind, ho
 }
 
 // NewProxy makes a new proxy instance.
-func NewProxy(opts ProxyOpts) (*Proxy, error) {
+func NewProxy(opts ProxyOpts) (*Proxy, error) { //nolint: funlen
 	if err := opts.valid(); err != nil {
 		return nil, fmt.Errorf("invalid settings: %w", err)
 	}
@@ -548,15 +977,17 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	logger := opts.getLogger("proxy")
 	updatersLogger := logger.Named("telegram-updaters")
 
-	set := newSecretSet(opts.getSecrets())
+	initialSet := buildSecretSet(opts.getSecrets(), opts.SecretAdTags, opts.GlobalAdTag, opts.SecretLimits)
 
 	stats := NewProxyStats()
-	for _, name := range set.names {
+	for _, name := range initialSet.names {
 		stats.PreRegister(name)
 	}
 
-	if opts.APIBindTo != "" {
-		stats.StartServer(ctx, opts.APIBindTo, logger)
+	if opts.UsageStateFile != "" {
+		if err := stats.LoadUsage(opts.UsageStateFile); err != nil {
+			logger.WarningError("cannot load usage state", err)
+		}
 	}
 
 	if opts.ThrottleMaxConnections > 0 {
@@ -573,6 +1004,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		ctxCancel:                cancel,
 		stats:                    stats,
 		sessions:                 newSessionRegistry(),
+		reloader:                 opts.SecretsReloader,
 		network:                  opts.Network,
 		antiReplayCache:          opts.AntiReplayCache,
 		blocklist:                opts.IPBlocklist,
@@ -601,15 +1033,50 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 			opts.Network.MakeHTTPClient(nil),
 		),
 		domainFrontingProxyProtocol: opts.DomainFrontingProxyProtocol,
+		ourIPv4:                     opts.PublicIPv4,
+		ourIPv6:                     opts.PublicIPv6,
+		advertisedPort:              opts.AdvertisedPort,
+		usageStateFile:              opts.UsageStateFile,
+		emitTraffic:                 opts.EmitTraffic,
 
+		securedDisabled:   opts.SecuredDisabled,
 		ddShapeEnabled:    opts.DDShapeEnabled,
 		ddShapeDelayMinMs: opts.getDDShapeDelayMinMs(),
 		ddShapeDelayMaxMs: opts.getDDShapeDelayMaxMs(),
 		ddShapeFragBytes:  opts.getDDShapeFragBytes(),
 	}
 
-	proxy.secretSet.Store(set)
-	stats.SetSecretsDigest(set.digest())
+	// The middle-proxy manager is always available so advertising can be
+	// enabled at runtime via the API. It fetches Telegram's proxy secret and
+	// middle-proxy list lazily (nothing happens until an ad-tagged stream is
+	// dialed), so a proxy without advertising never touches the network. When
+	// advertising is already configured, warm it so the first client is fast.
+	proxy.middleProxy = middleproxy.NewManager(
+		ctx,
+		opts.Network.MakeHTTPClient(nil),
+		updatersLogger.Named("middle-proxy"),
+		opts.getPreferIP(),
+	)
+
+	if opts.GlobalAdTag != nil || len(opts.SecretAdTags) > 0 {
+		proxy.middleProxy.Warm()
+	}
+
+	proxy.secrets.Store(initialSet)
+	stats.SetSecretsDigest(initialSet.digest())
+
+	// Start the management API only now that the proxy exists, so the routes
+	// can drive ReloadSecrets and the secrets/adtag mutators. /stats, /reload,
+	// /secrets and /adtag share the api-bind-to listener; reload is a
+	// no-op-with-error when no reloader was supplied.
+	if opts.APIBindTo != "" {
+		proxy.startAPIServer(ctx, opts.APIBindTo, opts.APIToken)
+	}
+
+	if opts.UsageStateFile != "" {
+		proxy.startUsagePersistence(ctx)
+	}
+
 	proxy.doppelGanger.Run()
 
 	if opts.AutoUpdate {
@@ -617,9 +1084,9 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		proxy.configUpdater.Run(ctx, dc.PublicConfigUpdateURLv6, "tcp6")
 	}
 
-	// Тёплый пул коннектов к DC (аналог me-pool telemt). Включён по умолчанию;
-	// filler'ы стартуют сразу и фейлят-ретраят, пока AutoUpdate не подтянет
-	// адреса DC — клиентов это не блокирует (фолбэк на холодный dial).
+	// Тёплый пул коннектов к DC (аналог me-pool telemt). Filler'ы стартуют сразу
+	// и фейлят-ретраят, пока AutoUpdate не подтянет адреса DC — клиентов это не
+	// блокирует (фолбэк на холодный dial).
 	if opts.DCPoolEnabled {
 		proxy.dcPool = newDCPool(
 			ctx,
@@ -648,99 +1115,4 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	proxy.workerPool = pool
 
 	return proxy, nil
-}
-
-// trackSession registers an authenticated session and counts it in the stats.
-// It fails if the secret the session has authenticated with was removed or
-// changed by UpdateSecrets after the handshake had started. Both happen under
-// the registry lock, so a concurrent update either sees the session and
-// closes it, or the session is rejected; the stats of a removed secret are
-// never recreated.
-func (p *Proxy) trackSession(ctx *streamContext) bool {
-	p.sessions.mu.Lock()
-	defer p.sessions.mu.Unlock()
-
-	if !p.secretSet.Load().sameSecret(ctx.secretName, ctx.matchedSecretKey) {
-		return false
-	}
-
-	p.sessions.add(ctx)
-	ctx.userStats = p.stats.getOrCreate(ctx.secretName)
-	ctx.userStats.connections.Add(1)
-
-	return true
-}
-
-// UpdateSecrets replaces the set of secrets without restarting the proxy.
-//
-// New handshakes use the new set right away. Live sessions of secrets that
-// are kept unchanged continue to work; sessions of removed secrets and of
-// secrets whose key or host has changed are closed. Other options (bind
-// addresses, domain fronting, defense settings) are not affected.
-func (p *Proxy) UpdateSecrets(secrets map[string]Secret) (SecretsUpdate, error) {
-	update := SecretsUpdate{}
-
-	if len(secrets) == 0 {
-		return update, ErrSecretEmpty
-	}
-
-	for name, secret := range secrets {
-		if !secret.Valid() {
-			return update, fmt.Errorf("invalid secret %q", name)
-		}
-	}
-
-	next := newSecretSet(secrets)
-
-	for _, name := range next.names {
-		p.stats.PreRegister(name)
-	}
-
-	toClose := []*streamContext{}
-	gone := []string{}
-
-	p.sessions.mu.Lock()
-
-	prev := p.secretSet.Swap(next)
-	p.stats.SetSecretsDigest(next.digest())
-
-	for _, name := range prev.names {
-		newSecret, ok := next.byName[name]
-
-		switch {
-		case !ok:
-			update.Removed++
-			gone = append(gone, name)
-		case newSecret != prev.byName[name]:
-			update.Changed++
-		default:
-			continue
-		}
-
-		for ctx := range p.sessions.sessions[name] {
-			toClose = append(toClose, ctx)
-		}
-
-		delete(p.sessions.sessions, name)
-	}
-
-	for _, name := range gone {
-		p.stats.Forget(name)
-	}
-
-	p.sessions.mu.Unlock()
-
-	for _, name := range next.names {
-		if _, ok := prev.byName[name]; !ok {
-			update.Added++
-		}
-	}
-
-	for _, ctx := range toClose {
-		ctx.closeFromOutside()
-	}
-
-	update.ClosedSessions = len(toClose)
-
-	return update, nil
 }

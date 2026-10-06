@@ -29,7 +29,7 @@ func newUpdateTestProxy(secrets map[string]Secret) *Proxy {
 		p.stats.PreRegister(name)
 	}
 
-	p.secretSet.Store(set)
+	p.secrets.Store(set)
 
 	return p
 }
@@ -95,7 +95,7 @@ func TestUpdateSecretsRejectsInvalidSet(t *testing.T) {
 	require.Error(t, err)
 
 	// A failed update leaves everything as it was.
-	assert.Equal(t, []string{"alice"}, p.secretSet.Load().names)
+	assert.Equal(t, []string{"alice"}, p.secrets.Load().names)
 	assert.False(t, isClosed(stream))
 }
 
@@ -117,7 +117,7 @@ func TestUpdateSecretsKeepsUnchangedSessions(t *testing.T) {
 	assert.False(t, isClosed(aliceSession))
 	assert.False(t, isClosed(bobSession))
 
-	set := p.secretSet.Load()
+	set := p.secrets.Load()
 	assert.Equal(t, []string{"alice", "bob", "carol"}, set.names)
 	assert.Equal(t, []string{"example.com", "other.example.com"}, set.hostnames)
 	assert.NotNil(t, p.stats.lookup("carol"))
@@ -181,7 +181,7 @@ func TestUpdateSecretsHostChangeClosesSessions(t *testing.T) {
 
 	assert.Equal(t, SecretsUpdate{Changed: 1, ClosedSessions: 1}, update)
 	assert.True(t, isClosed(stream))
-	assert.Equal(t, []string{"new.example.com"}, p.secretSet.Load().hostnames)
+	assert.Equal(t, []string{"new.example.com"}, p.secrets.Load().hostnames)
 }
 
 // A handshake that matched a secret before an update must not register a
@@ -381,10 +381,10 @@ func TestSecretsDigest(t *testing.T) {
 	alice := GenerateSecret("example.com")
 	bob := GenerateSecret("example.com")
 	p := newUpdateTestProxy(map[string]Secret{"bob": bob, "alice": alice})
-	p.stats.SetSecretsDigest(p.secretSet.Load().digest())
+	p.stats.SetSecretsDigest(p.secrets.Load().digest())
 
 	want := sha256.Sum256([]byte("alice=" + alice.Hex() + "\nbob=" + bob.Hex()))
-	assert.Equal(t, hex.EncodeToString(want[:]), p.secretSet.Load().digest())
+	assert.Equal(t, hex.EncodeToString(want[:]), p.secrets.Load().digest())
 
 	readDigest := func() string {
 		rec := httptest.NewRecorder()
