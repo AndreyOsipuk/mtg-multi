@@ -494,6 +494,32 @@ update-each = "24h"
 # Disabled by default.
 enabled = false
 
+# WEB mode: MTProto inside a real HTTPS session, compatible with the WEB proxy
+# type of Telegram Desktop (tg://webproxy links). mtg listens for plain HTTP on
+# loopback; a reverse proxy (nginx, Caddy) in front of it terminates TLS with a
+# real certificate and passes requests for the WEB domain. Everyone who is not
+# a client of this proxy gets the static decoy site. Users and secrets are the
+# same as for regular MTProto; the link is different.
+#
+# Streams inside WEB use the secured (obfuscated2) handshake. It is accepted for
+# WEB streams only and does not make the FakeTLS listener accept dd clients.
+[web]
+# Empty (default) disables the WEB mode. Must be a loopback address.
+bind-to = ""
+# Domain from the tg://webproxy link, served by the reverse proxy.
+host = ""
+# Key kind in the link: dd (default) or plain.
+secret-mode = "dd"
+# Static site for everyone else. Empty answers 404 like an ordinary server.
+decoy-dir = ""
+# Networks X-Forwarded-For is accepted from (default: localhost).
+trusted-proxies = ["127.0.0.1/32", "::1/128"]
+# Caps on live sessions and on bridge tokens not used yet.
+max-sessions = 1024
+max-pending = 4096
+# Log diagnostic marks from the bridge page. For troubleshooting only.
+diag = false
+
 # statsd statistics integration.
 [stats.statsd]
 # enabled/disabled

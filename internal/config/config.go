@@ -98,6 +98,16 @@ type Config struct {
 		MaxConnections TypeConcurrency `json:"maxConnections"`
 		CheckInterval  TypeDuration    `json:"checkInterval"`
 	} `json:"throttle"`
+	Web struct {
+		BindTo         string          `json:"bindTo"`
+		Host           string          `json:"host"`
+		SecretMode     string          `json:"secretMode"`
+		DecoyDir       string          `json:"decoyDir"`
+		TrustedProxies []string        `json:"trustedProxies"`
+		MaxSessions    TypeConcurrency `json:"maxSessions"`
+		MaxPending     TypeConcurrency `json:"maxPending"`
+		Diag           TypeBool        `json:"diag"`
+	} `json:"web"`
 	Secured Optional `json:"secured"`
 	Stats   struct {
 		StatsD struct {

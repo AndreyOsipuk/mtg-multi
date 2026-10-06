@@ -1,6 +1,10 @@
 package mtglib
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/mhsanaei/mtg-multi/essentials"
+)
 
 func TestIsFakeTLSHandshake(t *testing.T) {
 	t.Parallel()
@@ -40,5 +44,31 @@ func TestIsFakeTLSHandshake(t *testing.T) {
 				t.Fatalf("isFakeTLSHandshake() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+type securedStub struct {
+	essentials.Conn
+
+	secured bool
+}
+
+func (s securedStub) SecuredTransport() bool { return s.secured }
+
+// WEB streams mark themselves as secured transport: the dd handshake is
+// accepted for them without enabling it on the FakeTLS listener.
+func TestIsSecuredTransport(t *testing.T) {
+	t.Parallel()
+
+	if !isSecuredTransport(securedStub{secured: true}) {
+		t.Fatal("a connection that reports SecuredTransport must be recognized")
+	}
+
+	if isSecuredTransport(securedStub{secured: false}) {
+		t.Fatal("SecuredTransport() == false must not enable the secured handshake")
+	}
+
+	if isSecuredTransport(essentials.WrapNetConn(nil)) {
+		t.Fatal("a regular connection must not be a secured transport")
 	}
 }

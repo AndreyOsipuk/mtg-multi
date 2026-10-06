@@ -19,6 +19,7 @@ import (
 	"github.com/mhsanaei/mtg-multi/mtglib"
 	"github.com/mhsanaei/mtg-multi/network/v2"
 	"github.com/mhsanaei/mtg-multi/stats"
+	"github.com/mhsanaei/mtg-multi/web"
 	"github.com/pires/go-proxyproto"
 	"github.com/rs/zerolog"
 	"github.com/yl2chen/cidranger"
@@ -420,6 +421,27 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 		return fmt.Errorf("cannot create a proxy: %w", err)
 	}
 
+	// WEB mode: MTProto inside a real HTTPS session. Every logical stream goes
+	// through the same admission as a regular connection (allowlist, blocklist,
+	// worker pool) and into the same ServeConn, so the handshake, stats and
+	// limits work unchanged. The WEB user table follows the proxy's secret set,
+	// so users added, removed or re-keyed via reload or the management API get
+	// or lose WEB access without a restart.
+	webServer, webBind, err := setupWeb(conf, proxy, logger.Named("web"))
+	if err != nil {
+		return fmt.Errorf("cannot configure web mode: %w", err)
+	}
+
+	if webServer != nil {
+		defer webServer.Close()
+
+		go func() {
+			if err := web.Serve(webServer, webBind); err != nil {
+				logger.WarningError("web listener stopped", err)
+			}
+		}()
+	}
+
 	bindAddrs := conf.GetBindAddrs()
 	listeners := make([]net.Listener, 0, len(bindAddrs))
 
@@ -461,4 +483,79 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 	proxy.Shutdown()
 
 	return nil
+}
+
+func setupWeb(conf *config.Config, proxy *mtglib.Proxy, logger mtglib.Logger) (*web.Server, string, error) {
+	if strings.TrimSpace(conf.Web.BindTo) == "" {
+		return nil, "", nil
+	}
+
+	trusted := make([]*net.IPNet, 0, len(conf.Web.TrustedProxies))
+
+	for _, cidr := range conf.Web.TrustedProxies {
+		_, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
+		if err != nil {
+			return nil, "", fmt.Errorf("incorrect trusted-proxies value %q: %w", cidr, err)
+		}
+
+		trusted = append(trusted, network)
+	}
+
+	mode := web.SecretModeDD
+	if strings.EqualFold(strings.TrimSpace(conf.Web.SecretMode), string(web.SecretModePlain)) {
+		mode = web.SecretModePlain
+	}
+
+	settings := web.Settings{
+		BindTo:         conf.Web.BindTo,
+		Host:           conf.Web.Host,
+		SecretMode:     mode,
+		DecoyDir:       conf.Web.DecoyDir,
+		TrustedProxies: trusted,
+		MaxSessions:    int(conf.Web.MaxSessions.Get(0)), //nolint: gosec
+		MaxPending:     int(conf.Web.MaxPending.Get(0)),  //nolint: gosec
+		Diag:           conf.Web.Diag.Get(false),
+	}
+
+	var (
+		server   *web.Server
+		bind     string
+		setupErr error
+	)
+
+	// The first call comes synchronously with the current secret set and builds
+	// the server; later calls follow reloads and API changes.
+	proxy.OnSecretsChange(func(secrets map[string]mtglib.Secret) {
+		keys := webSecretKeys(secrets)
+
+		if server == nil {
+			if setupErr == nil {
+				server, bind, setupErr = web.Setup(settings, keys, func(stream *web.Stream) {
+					proxy.ServeStream(stream)
+				})
+			}
+
+			return
+		}
+
+		if err := server.UpdateSecrets(keys); err != nil {
+			logger.WarningError("cannot update web users, keeping the previous ones", err)
+		}
+	})
+
+	return server, bind, setupErr
+}
+
+// webSecretKeys converts the proxy secrets into the raw keys the WEB mode
+// derives capabilities from.
+func webSecretKeys(secrets map[string]mtglib.Secret) map[string][]byte {
+	keys := make(map[string][]byte, len(secrets))
+
+	for name, secret := range secrets {
+		key := make([]byte, len(secret.Key))
+		copy(key, secret.Key[:])
+		keys[name] = key
+	}
+
+	return keys
 }

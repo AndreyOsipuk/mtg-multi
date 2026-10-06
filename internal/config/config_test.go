@@ -213,6 +213,22 @@ func (suite *ConfigTestSuite) TestSecured() {
 	suite.True(conf.Secured.Enabled.Get(false))
 }
 
+func (suite *ConfigTestSuite) TestWeb() {
+	conf, err := config.Parse(suite.ReadConfig("web.toml"))
+	suite.NoError(err)
+	suite.NoError(conf.Validate())
+	suite.Equal("127.0.0.1:18080", conf.Web.BindTo)
+	suite.Equal("proxy.example.com", conf.Web.Host)
+	suite.Equal([]string{"127.0.0.1/32"}, conf.Web.TrustedProxies)
+	suite.EqualValues(100, conf.Web.MaxSessions.Get(0))
+}
+
+func (suite *ConfigTestSuite) TestWebDisabledByDefault() {
+	conf, err := config.Parse(suite.ReadConfig("minimal.toml"))
+	suite.NoError(err)
+	suite.Empty(conf.Web.BindTo)
+}
+
 func TestConfig(t *testing.T) {
 	t.Parallel()
 	suite.Run(t, &ConfigTestSuite{})

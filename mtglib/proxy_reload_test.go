@@ -218,3 +218,34 @@ func TestReloadHandler(t *testing.T) {
 		assert.Equal(t, http.StatusInternalServerError, rec.Code)
 	})
 }
+
+func TestProxyOnSecretsChange(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("alice.example.com")
+	bob := GenerateSecret("bob.example.com")
+
+	p := newLimitTestProxy(map[string]Secret{"alice": alice}, nil)
+
+	var seen []map[string]Secret
+
+	p.OnSecretsChange(func(secrets map[string]Secret) {
+		seen = append(seen, secrets)
+	})
+
+	// The current set is delivered right away.
+	require.Len(t, seen, 1)
+	assert.Equal(t, map[string]Secret{"alice": alice}, seen[0])
+
+	require.NoError(t, p.PutSecret("bob", bob, nil, nil))
+	require.Len(t, seen, 2)
+	assert.Equal(t, map[string]Secret{"alice": alice, "bob": bob}, seen[1])
+
+	require.NoError(t, p.DeleteSecret("alice"))
+	require.Len(t, seen, 3)
+	assert.Equal(t, map[string]Secret{"bob": bob}, seen[2])
+
+	// A rejected change is not reported.
+	require.Error(t, p.ReplaceSecrets(SecretConfig{}))
+	assert.Len(t, seen, 3)
+}

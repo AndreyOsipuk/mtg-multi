@@ -21,6 +21,8 @@ sponsored-channel ad-tag that mtg v2 removed.
 - **Per-user quotas, expiry & disable** — data caps (with optional monthly reset),
   a validity deadline, and an on/off switch, persisted across restarts.
 - **Public IP override** and **Docker-style environment variables**.
+- **WEB mode** (opt-in) — MTProto inside a real HTTPS session for Telegram
+  Desktop `tg://webproxy` links.
 
 Everything else — FakeTLS, domain fronting, the doppelganger traffic mimic,
 SOCKS5 proxy chaining, IP blocklists/allowlists, Prometheus and statsd metrics —
@@ -42,6 +44,7 @@ for the shared internals.
   - [Per-user quotas, expiry & disable](#per-user-quotas-expiry--disable)
   - [Public IP override](#public-ip-override)
   - [Environment variables](#environment-variables)
+  - [WEB mode](#web-mode)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
 - [Credits](#credits)
@@ -399,6 +402,53 @@ be captured by accident outside a container.
 `WORKERS` and `SECRET_COUNT` from the official image are not applicable — one Go
 process already uses every CPU core, and multiple secrets are configured through
 `[secrets]` or the API. Setting either is ignored with a startup warning.
+
+### WEB mode
+
+MTProto inside a real HTTPS session, compatible with the WEB proxy type of
+Telegram Desktop (`tg://webproxy` links). On the wire it is ordinary HTTPS to an
+ordinary site with a real certificate. mtg-multi serves plain HTTP on loopback;
+a reverse proxy with a real certificate terminates TLS in front of it. Everyone
+who is not a client gets the static decoy site (or a 404). Disabled by default:
+
+```toml
+[web]
+bind-to = "127.0.0.1:18080"
+host = "proxy.example.com"
+decoy-dir = "/var/www/decoy"
+```
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name proxy.example.com;
+    ssl_certificate     /etc/letsencrypt/live/proxy.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/proxy.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:18080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_buffering off;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+Users and secrets are the same as for regular MTProto; only the link differs:
+`tg://webproxy?server=proxy.example.com&secret=dd<32 hex chars of the key>`.
+The WEB user table follows hot reloads and the management API, and WEB streams
+are subject to the same per-user quotas, expiry, disable switch, ad-tag,
+throttling and stats as regular connections. Streams inside WEB use the
+secured (dd) handshake, which is accepted for WEB streams only and does not
+make the FakeTLS listener accept dd clients.
+
+The server side of this protocol was first implemented in
+[telemt](https://github.com/telemt/telemt). The `web` package is an independent
+Go implementation of the same protocol for compatibility and contains no telemt
+source code; only the capability test vectors are taken from telemt, to check
+that both derive the same values.
 
 ## Command reference
 

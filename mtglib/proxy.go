@@ -54,6 +54,16 @@ func (s *secretSet) effectiveAdTag(i int) *[AdTagLength]byte {
 	return s.globalAdTag
 }
 
+// secretsMap returns a fresh name -> secret map of the snapshot.
+func (s *secretSet) secretsMap() map[string]Secret {
+	out := make(map[string]Secret, len(s.names))
+	for i, name := range s.names {
+		out[name] = s.secrets[i]
+	}
+
+	return out
+}
+
 // toConfig reconstructs a mutable SecretConfig from the immutable snapshot. It
 // is the copy-on-write starting point for the management-API mutators, which
 // apply a delta and swap the result back in.
@@ -179,6 +189,10 @@ type Proxy struct {
 	allowlist       IPBlocklist
 	eventStream     EventStream
 	logger          Logger
+
+	// secretsObservers are notified of every new secret set (guarded by
+	// reloadMu); see OnSecretsChange.
+	secretsObservers []func(map[string]Secret)
 }
 
 // DomainFrontingAddress returns a host:port pair for a fronting domain.
@@ -282,6 +296,61 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	)
 }
 
+// ServeStream runs a stream that did not come from the proxy listener (a
+// WEB-mode logical stream) through the same admission as a regular
+// connection: IP allowlist/blocklist and the worker pool with its concurrency
+// limit. Without it WEB streams bypassed both.
+func (p *Proxy) ServeStream(conn essentials.Conn) {
+	p.dispatch(conn)
+}
+
+// dispatch applies IP allowlist/blocklist and hands the connection to the
+// worker pool. It returns false only when the pool is closed.
+func (p *Proxy) dispatch(conn net.Conn) bool {
+	ipAddr := remoteIP(conn)
+	logger := p.logger.BindStr("ip", ipAddr.String())
+
+	if !p.allowlist.Contains(ipAddr) {
+		conn.Close() //nolint: errcheck
+		logger.Info("ip was rejected by allowlist")
+		p.eventStream.Send(p.ctx, NewEventIPAllowlisted(ipAddr))
+
+		return true
+	}
+
+	if p.blocklist.Contains(ipAddr) {
+		conn.Close() //nolint: errcheck
+		logger.Info("ip was blacklisted")
+		p.eventStream.Send(p.ctx, NewEventIPBlocklisted(ipAddr))
+
+		return true
+	}
+
+	err := p.workerPool.Invoke(conn)
+
+	switch {
+	case err == nil:
+	case errors.Is(err, ants.ErrPoolClosed):
+		conn.Close() //nolint: errcheck
+
+		return false
+	case errors.Is(err, ants.ErrPoolOverload):
+		conn.Close() //nolint: errcheck
+		logger.Info("connection was concurrency limited")
+		p.eventStream.Send(p.ctx, NewEventConcurrencyLimited())
+	}
+
+	return true
+}
+
+func remoteIP(conn net.Conn) net.IP {
+	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		return addr.IP
+	}
+
+	return net.IPv4zero
+}
+
 // Serve starts a proxy on a given listener.
 func (p *Proxy) Serve(listener net.Listener) error {
 	p.streamWaitGroup.Add(1)
@@ -298,35 +367,8 @@ func (p *Proxy) Serve(listener net.Listener) error {
 			}
 		}
 
-		ipAddr := conn.RemoteAddr().(*net.TCPAddr).IP //nolint: forcetypeassert
-		logger := p.logger.BindStr("ip", ipAddr.String())
-
-		if !p.allowlist.Contains(ipAddr) {
-			conn.Close() //nolint: errcheck
-			logger.Info("ip was rejected by allowlist")
-			p.eventStream.Send(p.ctx, NewEventIPAllowlisted(ipAddr))
-
-			continue
-		}
-
-		if p.blocklist.Contains(ipAddr) {
-			conn.Close() //nolint: errcheck
-			logger.Info("ip was blacklisted")
-			p.eventStream.Send(p.ctx, NewEventIPBlocklisted(ipAddr))
-
-			continue
-		}
-
-		err = p.workerPool.Invoke(conn)
-
-		switch {
-		case err == nil:
-		case errors.Is(err, ants.ErrPoolClosed):
+		if !p.dispatch(conn) {
 			return nil
-		case errors.Is(err, ants.ErrPoolOverload):
-			conn.Close() //nolint: errcheck
-			logger.Info("connection was concurrency limited")
-			p.eventStream.Send(p.ctx, NewEventConcurrencyLimited())
 		}
 	}
 }
@@ -398,7 +440,26 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	p.closeStaleConns(oldSet, newSet)
 	p.closeDeniedConns()
 
+	for _, observer := range p.secretsObservers {
+		observer(newSet.secretsMap())
+	}
+
 	return nil
+}
+
+// OnSecretsChange registers fn to receive the active secrets (name -> secret)
+// right away and then after every change of the secret set: a reload or a
+// management-API mutation. Calls are serialized and come in the order of the
+// changes. It lets transports that keep their own view of the users, such as
+// the WEB mode, follow the proxy without a restart. fn must not call back into
+// the secret mutators.
+func (p *Proxy) OnSecretsChange(fn func(map[string]Secret)) {
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
+	p.secretsObservers = append(p.secretsObservers, fn)
+
+	fn(p.secrets.Load().secretsMap())
 }
 
 func (p *Proxy) registerConn(ctx *streamContext) {
@@ -573,7 +634,7 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		secretKeys[i] = set.secrets[i].Key[:]
 	}
 
-	if p.securedEnabled {
+	if p.securedEnabled || isSecuredTransport(ctx.clientConn) {
 		// Classify the transport before invoking a parser. A TLS ClientHello with
 		// an invalid HMAC is an active probe and must reach the mask host byte for
 		// byte; parsing its first 64 bytes as a secured handshake would consume and
@@ -655,6 +716,21 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	ctx.clientConn = tls.New(ctx.clientConn, true, false)
 
 	return true
+}
+
+// SecuredTransport is implemented by connections whose outer transport is not
+// FakeTLS and that carry plain obfuscated2 by design, such as WEB-mode streams
+// (MTProto inside a real HTTPS session). The secured handshake is accepted for
+// them even when ProxyOpts.SecuredEnabled is off, so enabling the WEB mode does
+// not make the FakeTLS listener accept dd clients.
+type SecuredTransport interface {
+	SecuredTransport() bool
+}
+
+func isSecuredTransport(conn essentials.Conn) bool {
+	st, ok := conn.(SecuredTransport)
+
+	return ok && st.SecuredTransport()
 }
 
 // isFakeTLSHandshake reports whether the first bytes look like a TLS 1.x
