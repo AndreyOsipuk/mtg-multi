@@ -337,6 +337,7 @@ func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyc
 
 		PendingHandshakesPerIP:  conf.Defense.PendingHandshakes.MaxPerIP.Get(0),
 		PendingHandshakesDryRun: conf.Defense.PendingHandshakes.DryRun.Get(false),
+		SecuredEnabled: conf.Secured.Enabled.Get(false),
 	}
 
 	proxy, err := mtglib.NewProxy(opts)

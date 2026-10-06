@@ -19,6 +19,10 @@ type streamContext struct {
 	dc               int
 	matchedSecretKey []byte
 	secretName       string
+	// secured is true for a secured ("dd") client: plain obfuscated2 without
+	// FakeTLS. Its obfuscated2 handshake is done in doSecuredHandshake, so
+	// ServeConn skips the FakeTLS-specific steps.
+	secured bool
 	logger           Logger
 
 	// releasePendingHandshake frees the per-IP pending-handshake slot, if any.
