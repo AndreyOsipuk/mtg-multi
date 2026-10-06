@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"github.com/dolonet/mtg-multi/internal/utils"
 	"net"
 	"strconv"
 	"time"
@@ -109,5 +110,7 @@ func (s *SimpleRun) Run(cli *CLI, version string) error { //nolint: cyclop,funle
 		return fmt.Errorf("invalid result configuration: %w", err)
 	}
 
-	return runProxy(conf, version, nil)
+	// Конфига-файла нет, перечитывать нечего; сигнал только ловим, чтобы
+	// SIGHUP не завершал процесс.
+	return runProxy(conf, version, utils.ReloadSignals(), nil)
 }

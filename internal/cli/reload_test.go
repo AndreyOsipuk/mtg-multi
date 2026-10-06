@@ -160,3 +160,17 @@ func TestWebProxyUpdater(t *testing.T) {
 		assert.Zero(t, proxy.callCount())
 	})
 }
+
+// Ревью: неверный секрет должен отсекаться до WEB, иначе WEB ушёл бы на новый
+// список, а прокси остался на старом.
+func TestWebProxyUpdaterRejectsInvalidBeforeWeb(t *testing.T) {
+	t.Parallel()
+
+	proxy := &fakeSecretsUpdater{}
+	webSide := &fakeWebUpdater{}
+
+	_, err := webProxyUpdater{proxy: proxy, web: webSide}.UpdateSecrets(map[string]mtglib.Secret{"bob": {}})
+	require.Error(t, err)
+	assert.Empty(t, webSide.calls)
+	assert.Zero(t, proxy.callCount())
+}

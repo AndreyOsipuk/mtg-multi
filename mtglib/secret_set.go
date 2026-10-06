@@ -2,7 +2,10 @@ package mtglib
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -53,7 +56,24 @@ func newSecretSet(secrets map[string]Secret) *secretSet {
 	return set
 }
 
+// digest - sha256 от строк "имя=секрет(hex)" в порядке имён через \n. Синк
+// считает то же самое из своего конфига и так проверяет, что перезагрузка
+// применилась целиком: по одним именам смену ключей не увидеть.
+func (s *secretSet) digest() string {
+	lines := make([]string, len(s.names))
+	for i, name := range s.names {
+		lines[i] = name + "=" + s.secrets[i].Hex()
+	}
+
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+
+	return hex.EncodeToString(sum[:])
+}
+
 // sameSecret reports whether name is present in the set with the given key.
+//
+// Сравнивается только ключ: смена одного host на рукопожатие не влияет (ключ
+// тот же), а уже открытые сессии такого пользователя закрывает UpdateSecrets.
 func (s *secretSet) sameSecret(name string, key []byte) bool {
 	secret, ok := s.byName[name]
 

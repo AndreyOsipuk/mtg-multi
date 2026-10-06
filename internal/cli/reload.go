@@ -76,6 +76,18 @@ type webProxyUpdater struct {
 }
 
 func (u webProxyUpdater) UpdateSecrets(secrets map[string]mtglib.Secret) (mtglib.SecretsUpdate, error) {
+	// Те же проверки, что в Proxy.UpdateSecrets, - до WEB: иначе WEB ушёл бы на
+	// новый список, а прокси отказал и остался на старом.
+	if len(secrets) == 0 {
+		return mtglib.SecretsUpdate{}, mtglib.ErrSecretEmpty
+	}
+
+	for name, secret := range secrets {
+		if !secret.Valid() {
+			return mtglib.SecretsUpdate{}, fmt.Errorf("invalid secret %q", name)
+		}
+	}
+
 	if err := u.web.UpdateSecrets(webSecrets(secrets)); err != nil {
 		return mtglib.SecretsUpdate{}, fmt.Errorf("web: %w", err)
 	}

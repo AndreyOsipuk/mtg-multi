@@ -35,6 +35,9 @@ type ProxyStats struct {
 	throttleLimit    int64
 	throttleInterval time.Duration
 	throttleActive   atomic.Bool
+
+	// secretsDigest - отпечаток набора секретов (см. secretSet.digest).
+	secretsDigest atomic.Value // string
 }
 
 // NewProxyStats creates a new ProxyStats instance.
@@ -87,14 +90,23 @@ func (s *ProxyStats) OnDisconnect(name string) {
 	}
 }
 
-// OnConnectIP registers an active client IP for a secret.
+// OnConnectIP registers an active client IP for a secret. A forgotten secret
+// is not recreated.
 func (s *ProxyStats) OnConnectIP(name, ip string) {
-	if ip == "" {
-		return
+	if st := s.lookup(name); st != nil {
+		st.addIP(ip)
 	}
+}
 
-	st := s.lookup(name)
-	if st == nil {
+// OnDisconnectIP unregisters an active client IP for a secret.
+func (s *ProxyStats) OnDisconnectIP(name, ip string) {
+	if st := s.lookup(name); st != nil {
+		st.removeIP(ip)
+	}
+}
+
+func (st *secretStats) addIP(ip string) {
+	if ip == "" {
 		return
 	}
 
@@ -107,14 +119,8 @@ func (s *ProxyStats) OnConnectIP(name, ip string) {
 	st.ips[ip]++
 }
 
-// OnDisconnectIP unregisters an active client IP for a secret.
-func (s *ProxyStats) OnDisconnectIP(name, ip string) {
+func (st *secretStats) removeIP(ip string) {
 	if ip == "" {
-		return
-	}
-
-	st := s.lookup(name)
-	if st == nil {
 		return
 	}
 
@@ -193,7 +199,20 @@ func (s *ProxyStats) CanConnect(name string) bool {
 		return true
 	}
 
-	return s.getOrCreate(name).connections.Load() < cap
+	// lookup, не getOrCreate: удалённого по SIGHUP пользователя запись не
+	// воскрешаем, его соединение всё равно отклонит trackSession.
+	st := s.lookup(name)
+	if st == nil {
+		return true
+	}
+
+	return st.connections.Load() < cap
+}
+
+// SetSecretsDigest публикует в /stats отпечаток текущего набора секретов, по
+// которому внешний синк проверяет, что перезагрузка применилась.
+func (s *ProxyStats) SetSecretsDigest(digest string) {
+	s.secretsDigest.Store(digest)
 }
 
 // startThrottleLoop runs a background goroutine that recomputes per-user
@@ -294,6 +313,9 @@ type StatsResponse struct {
 	TotalConnections int64                    `json:"total_connections"`
 	Throttle         *ThrottleJSON            `json:"throttle,omitempty"`
 	Users            map[string]UserStatsJSON `json:"users"`
+	// SecretsSHA256 - sha256 от отсортированных строк "имя=секрет(hex)" через
+	// \n. Меняется при каждой применённой смене ключей, не только имён.
+	SecretsSHA256 string `json:"secrets_sha256,omitempty"`
 }
 
 // ThrottleJSON is the throttle portion of the stats JSON response.
@@ -375,6 +397,10 @@ func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		TotalConnections: totalConns,
 		Throttle:         throttle,
 		Users:            users,
+	}
+
+	if digest, ok := s.secretsDigest.Load().(string); ok {
+		resp.SecretsSHA256 = digest
 	}
 
 	w.Header().Set("Content-Type", "application/json")

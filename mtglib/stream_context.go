@@ -11,10 +11,19 @@ import (
 )
 
 type streamContext struct {
-	ctx              context.Context
-	ctxCancel        context.CancelFunc
-	clientConn       essentials.Conn
-	telegramConn     essentials.Conn
+	ctx          context.Context
+	ctxCancel    context.CancelFunc
+	clientConn   essentials.Conn
+	telegramConn essentials.Conn
+	// rawConn - исходное соединение клиента. В отличие от clientConn, его никто
+	// не переписывает, поэтому только его можно закрывать из чужой горутины
+	// (перезагрузка секретов, остановка): clientConn/telegramConn ServeConn
+	// подменяет обёртками, и чтение интерфейса во время записи - гонка.
+	rawConn essentials.Conn
+	// userStats - запись статистики, в которой эта сессия учтена. Уменьшаем
+	// именно её: после удаления и повторного добавления пользователя по имени
+	// нашлась бы уже новая запись, и счётчик ушёл бы в минус.
+	userStats        *secretStats
 	streamID         string
 	dc               int
 	matchedSecretKey []byte
@@ -55,6 +64,16 @@ func (s *streamContext) Close() {
 	}
 }
 
+// closeFromOutside прерывает сессию из чужой горутины: отменяет контекст и
+// закрывает исходное соединение. Остальное закроет ServeConn в своём defer.
+func (s *streamContext) closeFromOutside() {
+	s.ctxCancel()
+
+	if s.rawConn != nil {
+		s.rawConn.Close() //nolint: errcheck
+	}
+}
+
 func (s *streamContext) ClientIP() net.IP {
 	return s.clientConn.RemoteAddr().(*net.TCPAddr).IP //nolint: forcetypeassert
 }
@@ -71,6 +90,7 @@ func newStreamContext(ctx context.Context, logger Logger, clientConn essentials.
 		ctx:        ctx,
 		ctxCancel:  cancel,
 		clientConn: clientConn,
+		rawConn:    clientConn,
 		streamID:   base64.RawURLEncoding.EncodeToString(connIDBytes),
 	}
 	streamCtx.logger = logger.
