@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,6 +32,10 @@ const (
 	// Только на время разбора: это лишний открытый путь на сервере.
 	envDiag           = "MTG_WEB_DIAG"
 	envTrustedProxies = "MTG_WEB_TRUSTED_PROXIES"
+	// MTG_WEB_MAX_SESSIONS / MTG_WEB_MAX_PENDING - пределы живых сессий и
+	// выданных мостом токенов (по умолчанию 1024 и 4096).
+	envMaxSessions = "MTG_WEB_MAX_SESSIONS"
+	envMaxPending  = "MTG_WEB_MAX_PENDING"
 )
 
 // Ошибки настройки.
@@ -114,6 +119,14 @@ func SetupFromEnv(secrets map[string][]byte, handle func(*Stream)) (*Server, str
 	cfg.TrustedProxyCIDRs = trusted
 	cfg.Bridge = DefaultBridge{}
 	cfg.Handle = handle
+
+	if n, ok := envPositiveInt(envMaxSessions); ok {
+		cfg.MaxSessions = n
+	}
+
+	if n, ok := envPositiveInt(envMaxPending); ok {
+		cfg.MaxPending = n
+	}
 
 	if strings.EqualFold(strings.TrimSpace(os.Getenv(envDiag)), "on") {
 		cfg.Diag = func(clientIP, message string) {
@@ -206,4 +219,15 @@ func Serve(srv *Server, bind string) error {
 	}
 
 	return httpServer.ListenAndServe()
+}
+
+// envPositiveInt читает положительное число из окружения; пусто или мусор -
+// остаётся значение по умолчанию.
+func envPositiveInt(name string) (int, bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+
+	return n, true
 }

@@ -170,6 +170,61 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	)
 }
 
+// ServeStream runs a stream that did not come from the proxy listener (a
+// WEB-mode logical stream) through the same admission as a regular
+// connection: IP allowlist/blocklist and the worker pool with its concurrency
+// limit. Without it WEB streams bypassed both.
+func (p *Proxy) ServeStream(conn essentials.Conn) {
+	p.dispatch(conn)
+}
+
+// dispatch applies IP allowlist/blocklist and hands the connection to the
+// worker pool. It returns false only when the pool is closed.
+func (p *Proxy) dispatch(conn net.Conn) bool {
+	ipAddr := remoteIP(conn)
+	logger := p.logger.BindStr("ip", ipAddr.String())
+
+	if !p.allowlist.Contains(ipAddr) {
+		conn.Close() //nolint: errcheck
+		logger.Info("ip was rejected by allowlist")
+		p.eventStream.Send(p.ctx, NewEventIPAllowlisted(ipAddr))
+
+		return true
+	}
+
+	if p.blocklist.Contains(ipAddr) {
+		conn.Close() //nolint: errcheck
+		logger.Info("ip was blacklisted")
+		p.eventStream.Send(p.ctx, NewEventIPBlocklisted(ipAddr))
+
+		return true
+	}
+
+	err := p.workerPool.Invoke(conn)
+
+	switch {
+	case err == nil:
+	case errors.Is(err, ants.ErrPoolClosed):
+		conn.Close() //nolint: errcheck
+
+		return false
+	case errors.Is(err, ants.ErrPoolOverload):
+		conn.Close() //nolint: errcheck
+		logger.Info("connection was concurrency limited")
+		p.eventStream.Send(p.ctx, NewEventConcurrencyLimited())
+	}
+
+	return true
+}
+
+func remoteIP(conn net.Conn) net.IP {
+	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		return addr.IP
+	}
+
+	return net.IPv4zero
+}
+
 // Serve starts a proxy on a given listener.
 func (p *Proxy) Serve(listener net.Listener) error {
 	p.streamWaitGroup.Add(1)
@@ -186,35 +241,8 @@ func (p *Proxy) Serve(listener net.Listener) error {
 			}
 		}
 
-		ipAddr := conn.RemoteAddr().(*net.TCPAddr).IP //nolint: forcetypeassert
-		logger := p.logger.BindStr("ip", ipAddr.String())
-
-		if !p.allowlist.Contains(ipAddr) {
-			conn.Close() //nolint: errcheck
-			logger.Info("ip was rejected by allowlist")
-			p.eventStream.Send(p.ctx, NewEventIPAllowlisted(ipAddr))
-
-			continue
-		}
-
-		if p.blocklist.Contains(ipAddr) {
-			conn.Close() //nolint: errcheck
-			logger.Info("ip was blacklisted")
-			p.eventStream.Send(p.ctx, NewEventIPBlocklisted(ipAddr))
-
-			continue
-		}
-
-		err = p.workerPool.Invoke(conn)
-
-		switch {
-		case err == nil:
-		case errors.Is(err, ants.ErrPoolClosed):
+		if !p.dispatch(conn) {
 			return nil
-		case errors.Is(err, ants.ErrPoolOverload):
-			conn.Close() //nolint: errcheck
-			logger.Info("connection was concurrency limited")
-			p.eventStream.Send(p.ctx, NewEventConcurrencyLimited())
 		}
 	}
 }

@@ -64,8 +64,14 @@ type ServerConfig struct {
 	SessionTTL time.Duration
 	// MaxBodyBytes - потолок тела запроса.
 	MaxBodyBytes int64
-	Session      SessionConfig
-	Bridge       BridgeRenderer
+	// MaxSessions - потолок живых сессий, MaxPending - выданных мостом, но ещё
+	// не использованных токенов. Без них обе таблицы росли без предела от
+	// любого, кто дёргает страницу-мост. При заполнении отвечаем заглушкой,
+	// как обычный сайт.
+	MaxSessions int
+	MaxPending  int
+	Session     SessionConfig
+	Bridge      BridgeRenderer
 	// Handle вызывается на каждый логический поток: это Proxy.ServeConn.
 	Handle func(*Stream)
 	// Diag принимает отметки от страницы-моста. nil = приём выключен, и
@@ -79,6 +85,8 @@ func DefaultServerConfig() ServerConfig {
 		LongPollTimeout: 25 * time.Second,
 		SessionTTL:      2 * time.Minute,
 		MaxBodyBytes:    2 * 1024 * 1024,
+		MaxSessions:     1024,
+		MaxPending:      4096,
 		Session:         DefaultSessionConfig(),
 	}
 }
@@ -146,6 +154,13 @@ func (s *Server) Close() {
 }
 
 // SessionCount сообщает число живых сессий.
+func (s *Server) sessionsFull() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.cfg.MaxSessions > 0 && len(s.sessions) >= s.cfg.MaxSessions
+}
+
 func (s *Server) SessionCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -239,9 +254,13 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, vhost VHost)
 		return
 	}
 
-	body, csp := s.cfg.Bridge.Render(vhost.Host, encodeToken(token))
+	if !s.registerPending(tokenHash(token), profile, clientIP(r, s.cfg.TrustedProxyCIDRs)) {
+		vhost.serveDecoy(w, r)
 
-	s.registerPending(tokenHash(token), profile, clientIP(r, s.cfg.TrustedProxyCIDRs))
+		return
+	}
+
+	body, csp := s.cfg.Bridge.Render(vhost.Host, encodeToken(token))
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -267,10 +286,18 @@ type pendingToken struct {
 	issued   time.Time
 }
 
-func (s *Server) registerPending(hash TokenHash, profile Profile, ip net.IP) {
+// registerPending запоминает выданный токен. false - таблица заполнена.
+func (s *Server) registerPending(hash TokenHash, profile Profile, ip net.IP) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.cfg.MaxPending > 0 && len(s.pending) >= s.cfg.MaxPending {
+		return false
+	}
+
 	s.pending[hash] = pendingToken{profile: profile, clientIP: ip, issued: time.Now()}
-	s.mu.Unlock()
+
+	return true
 }
 
 // takePending забирает выданный токен ровно один раз: повторное использование
@@ -300,6 +327,12 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request, vhost VHo
 		return
 	}
 
+	if s.sessionsFull() {
+		vhost.serveDecoy(w, r)
+
+		return
+	}
+
 	issued, ok := s.takePending(hash)
 	if !ok {
 		vhost.serveDecoy(w, r)
@@ -310,6 +343,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request, vhost VHo
 	session := NewSession(Token(hash), issued.profile, issued.clientIP, s.cfg.Session, s.cfg.Handle)
 
 	s.mu.Lock()
+	if s.cfg.MaxSessions > 0 && len(s.sessions) >= s.cfg.MaxSessions {
+		s.mu.Unlock()
+		session.Close()
+		vhost.serveDecoy(w, r)
+
+		return
+	}
 	s.sessions[hash] = session
 	s.mu.Unlock()
 

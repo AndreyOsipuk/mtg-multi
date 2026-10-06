@@ -3,7 +3,9 @@ package mtglib_test
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/dolonet/mtg-multi/essentials"
 	"io"
 	"net"
 	"net/http"
@@ -197,4 +199,81 @@ func (suite *ProxyTestSuite) TestHTTPSRequest() {
 func TestProxy(t *testing.T) {
 	t.Parallel()
 	suite.Run(t, &ProxyTestSuite{})
+}
+
+// A WEB-mode stream goes through the same admission as a regular connection:
+// a stream from a blocklisted address is closed instead of being served.
+func TestProxyServeStreamAppliesBlocklist(t *testing.T) {
+	t.Parallel()
+
+	dialer, err := network.NewDefaultDialer(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ntw, err := network.NewNetwork(dialer, "mtgtest", "1.1.1.1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, loopback, _ := net.ParseCIDR("127.0.0.0/8")
+
+	blocklist, _ := ipblocklist.NewFireholFromFiles(
+		logger.NewNoopLogger(), 1, []files.File{files.NewMem([]*net.IPNet{loopback})}, nil)
+	allowlist, _ := ipblocklist.NewFireholFromFiles(
+		logger.NewNoopLogger(), 1, []files.File{files.NewMem([]*net.IPNet{cidranger.AllIPv4, cidranger.AllIPv6})}, nil)
+
+	go blocklist.Run(time.Second)
+	go allowlist.Run(time.Second)
+
+	proxy, err := mtglib.NewProxy(mtglib.ProxyOpts{
+		Secret:          mtglib.GenerateSecret("httpbin.org"),
+		Network:         ntw,
+		AntiReplayCache: antireplay.NewNoop(),
+		IPBlocklist:     blocklist,
+		IPAllowlist:     allowlist,
+		EventStream:     events.NewNoopStream(),
+		Logger:          logger.NewNoopLogger(),
+		UseTestDCs:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Shutdown()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close() //nolint: errcheck
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close() //nolint: errcheck
+
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until the blocklist has loaded the in-memory range.
+	deadline := time.Now().Add(2 * time.Second)
+	for !blocklist.Contains(net.ParseIP("127.0.0.1")) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	proxy.ServeStream(server.(essentials.Conn)) //nolint: forcetypeassert
+
+	client.SetReadDeadline(time.Now().Add(time.Second)) //nolint: errcheck
+
+	if _, err := client.Read(make([]byte, 1)); err == nil {
+		t.Fatal("a stream from a blocklisted address must be closed")
+	} else {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatal("a stream from a blocklisted address must be closed, not left open")
+		}
+	}
 }

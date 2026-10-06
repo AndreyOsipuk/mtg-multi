@@ -364,8 +364,10 @@ func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyc
 			secrets[name] = key
 		}
 
+		// Через общий допуск: allowlist/blocklist и пул воркеров с лимитом
+		// concurrency, как у обычного соединения (раньше WEB шёл мимо них).
 		webServer, webBind, err := web.SetupFromEnv(secrets, func(stream *web.Stream) {
-			proxy.ServeConn(stream)
+			proxy.ServeStream(stream)
 		})
 		if err != nil {
 			return fmt.Errorf("cannot configure web mode: %w", err)

@@ -34,7 +34,7 @@ func (stubDecoy) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	_, _ = io.WriteString(w, decoyBody)
 }
 
-func newTestServer(t *testing.T, handle func(*web.Stream)) (*web.Server, web.Profile) {
+func newTestServer(t *testing.T, handle func(*web.Stream), opts ...func(*web.ServerConfig)) (*web.Server, web.Profile) {
 	t.Helper()
 
 	capability, err := web.DeriveCapability(web.ClientSecret([]byte(testSecret), web.SecretModeDD), testHost)
@@ -59,6 +59,10 @@ func newTestServer(t *testing.T, handle func(*web.Stream)) (*web.Server, web.Pro
 	}
 
 	cfg.Handle = handle
+
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 
 	srv := web.NewServer(cfg)
 	t.Cleanup(srv.Close)
@@ -322,4 +326,37 @@ func TestServerLongPollReturnsEmpty(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Empty(t, rec.Body.Bytes())
 	assert.GreaterOrEqual(t, time.Since(start), 200*time.Millisecond)
+}
+
+// Таблица выданных мостом токенов ограничена: иначе её раздувал бы любой, кто
+// дёргает страницу-мост. При заполнении - обычная заглушка, как у сайта.
+func TestServerPendingTokensAreCapped(t *testing.T) {
+	srv, profile := newTestServer(t, nil, func(cfg *web.ServerConfig) { cfg.MaxPending = 2 })
+
+	for range 2 {
+		rec := do(srv, bridgeRequest(profile))
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Contains(t, rec.Body.String(), "мост")
+	}
+
+	rec := do(srv, bridgeRequest(profile))
+	assert.Equal(t, decoyBody, rec.Body.String())
+}
+
+// Живых сессий не больше MaxSessions; лишняя получает заглушку.
+func TestServerSessionsAreCapped(t *testing.T) {
+	srv, profile := newTestServer(t, nil, func(cfg *web.ServerConfig) { cfg.MaxSessions = 1 })
+
+	openSession(t, srv, profile)
+	require.Equal(t, 1, srv.SessionCount())
+
+	rec := do(srv, bridgeRequest(profile))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	fields := strings.Fields(strings.TrimSuffix(rec.Body.String(), "</html>"))
+	token := fields[len(fields)-1]
+
+	rec = do(srv, carrierRequest("/api/v1/session", token, web.Encode(web.FrameHello, 0, []byte{1})))
+	assert.Equal(t, decoyBody, rec.Body.String())
+	assert.Equal(t, 1, srv.SessionCount())
 }
