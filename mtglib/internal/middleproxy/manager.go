@@ -247,8 +247,9 @@ type middleAddress struct {
 
 // orderedAddresses returns the middle-proxy addresses to try for dc, honoring
 // the IP-family preference and including both DC signs (Telegram lists +N and
-// -N separately). The requested dc is passed as its absolute value; both +dc
-// and -dc entries are returned.
+// -N separately). The requested dc keeps the client's sign (a negative id is
+// a media DC), so entries of that sign come first, followed by the opposite
+// sign as a fallback.
 func (m *Manager) orderedAddresses(dc int) []middleAddress {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

@@ -216,3 +216,24 @@ func TestReverseBytes(t *testing.T) {
 	assert.Equal(t, []byte{1}, reverseBytes([]byte{1}))
 	assert.Empty(t, reverseBytes([]byte{}))
 }
+
+func TestOrderedAddressesKeepsDCSign(t *testing.T) {
+	t.Parallel()
+
+	m := &Manager{
+		preferIP: "prefer-ipv4",
+		middleV4: map[int][]string{
+			2:  {"149.154.162.38:80"},
+			-2: {"95.161.76.100:8888"},
+		},
+	}
+
+	media := m.orderedAddresses(-2)
+	require.Len(t, media, 2)
+	assert.Equal(t, "95.161.76.100:8888", media[0].addr)
+	assert.Equal(t, "149.154.162.38:80", media[1].addr)
+
+	regular := m.orderedAddresses(2)
+	require.Len(t, regular, 2)
+	assert.Equal(t, "149.154.162.38:80", regular[0].addr)
+}
