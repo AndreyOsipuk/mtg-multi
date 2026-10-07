@@ -91,6 +91,11 @@ type Config struct {
 
 		FrameTimeout TypeDuration `json:"frameTimeout"`
 	} `json:"secured"`
+	DCPool struct {
+		Optional
+
+		Size TypeConcurrency `json:"size"`
+	} `json:"dcPool"`
 	Stats struct {
 		StatsD struct {
 			Optional
