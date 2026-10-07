@@ -1,3 +1,20 @@
+// Portions of this file are adapted from telemt (https://github.com/telemt/telemt),
+// Copyright (c) 2026 Telemt, licensed under the TELEMT LICENSE 3.3 (see
+// web/LICENSE.telemt). This is a modified version, not official Telemt.
+// Adapted: accepting the port from the parent (the checks of the
+// tproxy-init message and of the 127.0.0.1 origin), the Android
+// TelegramWebProxy shim and its polling, fail/status/traffic messages to the
+// port, the /api/v1/session|up|down paths and the fetch options.
+// Changes: a single script instead of telemt's eight modules; the bootstrap
+// token is used as the session token (no separate session token); no
+// sequence numbers, acks or cursors on /up and /down, no retries and no
+// recovery (any failed request ends the bridge), no WebSocket carrier, no
+// lanes, no queue limits on the page; the WELCOME frame is passed to
+// Telegram as received, without telemt's shape check; the Android shim passes
+// a received buffer as is instead of splitting it into frames; free-text
+// diagnostic marks, put into the page only when the server enables them,
+// instead of telemt's fixed diagnostic events; comments rewritten.
+
 // Bridge between Telegram Desktop and our HTTP transport.
 //
 // Telegram itself opens this page in a webview via https://<host>/?bridge=...
@@ -32,22 +49,11 @@
   let helloTimer = null;
 
   // Debug marks: the embedded Telegram webview has no console, so the page
-  // reports its progress to the server itself. Sending never waits and never
-  // interferes with the bridge: when the endpoint is disabled, the server just
-  // returns the decoy.
-  const report = (message) => {
-    try {
-      fetch(ORIGIN + '/api/v1/diag', {
-        method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'text/plain' },
-        body: message,
-        cache: 'no-store',
-        credentials: 'omit',
-      }).catch(() => {});
-    } catch (error) {
-      // Diagnostics must never interfere with the bridge.
-    }
-  };
+  // reports its progress to the server itself. The server puts the reporter
+  // in only when diagnostics are enabled; otherwise report is a no-op and the
+  // page never calls the diagnostic endpoint. Marks are sent on events, never
+  // per data frame.
+  const report = __REPORT__;
 
   addEventListener('error', (event) => report('script error: ' + (event.message || '') + ' @' + (event.lineno || '?')));
   addEventListener('unhandledrejection', (event) => report('unhandled rejection: ' + String(event.reason)));
@@ -224,8 +230,12 @@
 
     port.onmessage = (event) => {
       const data = event.data;
-      report('frame from port: type=' + Object.prototype.toString.call(data) +
-        ' size=' + (data && (data.byteLength ?? data.length ?? '?')));
+      // Only the first frame (Telegram's HELLO) and control messages: one
+      // report per data frame would double the request rate.
+      if (!sessionStarted || !(data instanceof ArrayBuffer)) {
+        report('frame from port: type=' + Object.prototype.toString.call(data) +
+          ' size=' + (data && (data.byteLength ?? data.length ?? '?')));
+      }
 
       if (data instanceof ArrayBuffer) {
         if (!sessionStarted) {

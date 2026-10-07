@@ -11,7 +11,7 @@ import (
 
 // Test vectors taken from telemt (https://github.com/telemt/telemt),
 // Copyright (c) 2026 Telemt, licensed under the TELEMT LICENSE 3.3; see
-// web/testdata/LICENSE.telemt. They come from config/load/runtime_web.rs
+// web/LICENSE.telemt. They come from config/load/runtime_web.rs
 // (later config/load/runtime_web/tests.rs), where the WEB server side was
 // implemented first.
 //
