@@ -110,6 +110,8 @@ server {
 }
 ```
 
+Origin: the WEB protocol was first implemented server side in [telemt](https://github.com/telemt/telemt). The bridge page and its HTML, CSP and Permissions-Policy (`web/bridge.go`, `web/bridge/runtime.js`) are adapted from telemt, and the capability test vectors are taken from it; those parts are used under the TELEMT LICENSE 3.3 (see [`web/LICENSE.telemt`](web/LICENSE.telemt)), and the adapted files list their changes. The Go server side is written anew after telemt's protocol.
+
 Notes:
 
 - `X-Forwarded-For` is the only source of the client address (mtg listens on loopback, so the peer is always 127.0.0.1). It must hold exactly one address. A missing, repeated or comma-separated header is refused with the decoy and logged (at most once a minute), instead of letting the client through as 127.0.0.1, where the allowlist and the blocklist would not see it. With `$proxy_add_x_forwarded_for` this breaks every client that sends its own header, so use `$remote_addr`.
@@ -234,6 +236,8 @@ bind-to = "127.0.0.1:18080"
 host = "proxy.example.com"
 decoy-dir = "/var/www/decoy"
 ```
+
+Происхождение: протокол WEB впервые реализован на стороне сервера в [telemt](https://github.com/telemt/telemt). Страница-мост и её HTML, CSP и Permissions-Policy (`web/bridge.go`, `web/bridge/runtime.js`) адаптированы из telemt, тестовые векторы capability взяты оттуда же; эти части используются по лицензии TELEMT LICENSE 3.3 (см. [`web/LICENSE.telemt`](web/LICENSE.telemt)), изменения перечислены в заголовках файлов. Серверная часть на Go написана заново по протоколу telemt.
 
 Пример nginx - в английской части выше. Важно:
 
