@@ -1,3 +1,20 @@
+// Portions of this file are adapted from telemt (https://github.com/telemt/telemt),
+// Copyright (c) 2026 Telemt, licensed under the TELEMT LICENSE 3.3 (see
+// web/LICENSE.telemt). This is a modified version, not official Telemt.
+// Adapted: accepting the port from the parent (the checks of the
+// tproxy-init message and of the 127.0.0.1 origin), the Android
+// TelegramWebProxy shim and its polling, fail/status/traffic messages to the
+// port, the /api/v1/session|up|down paths and the fetch options.
+// Changes: a single script instead of telemt's eight modules; the bootstrap
+// token is used as the session token (no separate session token); no
+// sequence numbers, acks or cursors on /up and /down, no retries and no
+// recovery (any failed request ends the bridge), no WebSocket carrier, no
+// lanes, no queue limits on the page; the WELCOME frame is passed to
+// Telegram as received, without telemt's shape check; the Android shim passes
+// a received buffer as is instead of splitting it into frames; free-text
+// diagnostic marks, put into the page only when the server enables them,
+// instead of telemt's fixed diagnostic events; comments rewritten.
+
 // Мост между Telegram Desktop и нашим HTTP-транспортом.
 //
 // Страницу открывает сам Telegram в вебвью по ссылке https://<хост>/?bridge=...
@@ -30,21 +47,11 @@
   let helloTimer = null;
 
   // Отметки для разбора: во встроенном вебвью Telegram нет консоли, поэтому
-  // страница сама рассказывает серверу, докуда дошла. Отправка ничего не ждёт
-  // и не мешает работе - при выключенном приёме сервер просто отдаёт заглушку.
-  const report = (message) => {
-    try {
-      fetch(ORIGIN + '/api/v1/diag', {
-        method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'text/plain' },
-        body: message,
-        cache: 'no-store',
-        credentials: 'omit',
-      }).catch(() => {});
-    } catch (error) {
-      // Диагностика не имеет права мешать работе моста.
-    }
-  };
+  // страница сама рассказывает серверу, докуда дошла. Отправитель сервер
+  // вставляет в страницу только при включённой диагностике; иначе report
+  // ничего не делает и страница не обращается к диагностике вовсе. Отметки
+  // шлются по событиям, а не на каждый кадр данных.
+  const report = __REPORT__;
 
   addEventListener('error', (event) => report('ошибка скрипта: ' + (event.message || '') + ' @' + (event.lineno || '?')));
   addEventListener('unhandledrejection', (event) => report('необработанный отказ: ' + String(event.reason)));
@@ -218,8 +225,12 @@
 
     port.onmessage = (event) => {
       const data = event.data;
-      report('кадр из порта: тип=' + Object.prototype.toString.call(data) +
-        ' размер=' + (data && (data.byteLength ?? data.length ?? '?')));
+      // Только первый кадр (HELLO от Telegram) и служебные сообщения: отметка
+      // на каждый кадр данных удвоила бы число запросов.
+      if (!sessionStarted || !(data instanceof ArrayBuffer)) {
+        report('кадр из порта: тип=' + Object.prototype.toString.call(data) +
+          ' размер=' + (data && (data.byteLength ?? data.length ?? '?')));
+      }
 
       if (data instanceof ArrayBuffer) {
         if (!sessionStarted) {

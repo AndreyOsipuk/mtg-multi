@@ -129,6 +129,7 @@ func SetupFromEnv(secrets map[string][]byte, handle func(*Stream)) (*Server, str
 	}
 
 	if strings.EqualFold(strings.TrimSpace(os.Getenv(envDiag)), "on") {
+		cfg.Bridge = DefaultBridge{Diag: true}
 		cfg.Diag = func(clientIP, message string) {
 			log.Printf("[web-diag] %s: %s", clientIP, message)
 		}

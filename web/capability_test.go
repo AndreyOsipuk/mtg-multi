@@ -9,6 +9,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Test vectors taken from telemt (https://github.com/telemt/telemt),
+// Copyright (c) 2026 Telemt, licensed under the TELEMT LICENSE 3.3; see
+// web/LICENSE.telemt.
+//
 // Эталонные векторы взяты из telemt (config/load/runtime_web.rs), где серверная
 // часть WEB реализована первой. Их назначение - доказать, что наш Go считает
 // ровно то же значение, которое вычисляет Telegram Desktop: разойдись мы хоть
