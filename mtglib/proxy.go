@@ -366,6 +366,12 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 // (MTProto inside a real HTTPS session). The secured handshake is accepted for
 // them even when ProxyOpts.SecuredEnabled is off, so enabling the WEB mode does
 // not make the FakeTLS listener accept dd clients.
+//
+// The check is a plain type assertion on the connection handed to the worker
+// pool, which ServeConn keeps as ctx.clientConn up to the handshake, so the
+// stream type itself must implement this interface: a wrapper (for example
+// essentials.WrapNetConn) hides the method, and such a stream is then parsed
+// as FakeTLS and rejected, which is safe but confusing.
 type SecuredTransport interface {
 	SecuredTransport() bool
 }
