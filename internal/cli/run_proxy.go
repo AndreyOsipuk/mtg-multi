@@ -351,6 +351,7 @@ func runProxy(
 
 		DCPoolEnabled: conf.DCPool.Enabled.Get(false),
 		DCPoolSize:    conf.DCPool.Size.Get(0),
+		DCPoolDCs:     conf.DCPool.DCs,
 	}
 
 	// The [web] section is parsed and validated, but the WEB listener itself
