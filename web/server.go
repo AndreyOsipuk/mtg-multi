@@ -368,8 +368,9 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, vhost VHost)
 	// as 127.0.0.1, which the lists would not recognize.
 	ip, ok := forwardedClientIP(r)
 	if !ok {
-		s.warnEach("xff", "web: a client was refused because X-Forwarded-For is missing, repeated or a list; "+
-			"the reverse proxy must set exactly one address: proxy_set_header X-Forwarded-For $remote_addr")
+		s.warnEach("xff", "web: a client was refused because X-Forwarded-For is missing, repeated or a list, "+
+			"or the request did not come from a loopback address; mtg must sit behind a local reverse proxy "+
+			"that sets exactly one address: proxy_set_header X-Forwarded-For $remote_addr")
 		vhost.serveDecoy(w, r)
 
 		return

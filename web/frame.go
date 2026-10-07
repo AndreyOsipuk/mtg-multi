@@ -98,8 +98,6 @@ type Frame struct {
 var (
 	// ErrEmptyBatch is returned for an empty request body.
 	ErrEmptyBatch = errors.New("web: body has no frames")
-	// ErrTooManyFrames is returned when the body has more frames than allowed.
-	ErrTooManyFrames = errors.New("web: too many frames in body")
 	// ErrIncomplete is returned when a header or payload is truncated.
 	ErrIncomplete = errors.New("web: truncated frame")
 	// ErrPayloadLimit is returned when a payload exceeds the limit.
@@ -116,14 +114,12 @@ var (
 // They are enforced before any allocation: the body comes from the network,
 // and "allocate whatever we are told" is a direct path to memory exhaustion.
 type Limits struct {
-	MaxFramesPerBody   int
 	MaxFramePayloadLen int
 }
 
 // DefaultLimits are sensible default values.
 func DefaultLimits() Limits {
 	return Limits{
-		MaxFramesPerBody:   256,
 		MaxFramePayloadLen: DataChunkBytes,
 	}
 }
@@ -138,10 +134,6 @@ func ParseAll(input []byte, limits Limits) ([]Frame, error) {
 	rest := input
 
 	for len(rest) > 0 {
-		if len(frames) >= limits.MaxFramesPerBody {
-			return nil, ErrTooManyFrames
-		}
-
 		if len(rest) < HeaderBytes {
 			return nil, ErrIncomplete
 		}
