@@ -3,6 +3,8 @@ package web_test
 import (
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -87,4 +89,25 @@ func TestDefaultBridgeKeepsLicenceHeader(t *testing.T) {
 
 		assert.Contains(t, body, notice, "diag=%v", diag)
 	}
+}
+
+// One /up body from the page must fit both the server limit and nginx's
+// default client_max_body_size (1m), so that a burst of uploads does not
+// depend on the proxy settings: a 413 from the proxy ends the bridge. One
+// full frame must still fit, or the page could not send it at all.
+func TestDefaultBridgeCapsUpBody(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("bridge", "runtime.js"))
+	require.NoError(t, err)
+
+	match := regexp.MustCompile(`const MAX_UP_BYTES = (\d+) \* 1024;`).FindSubmatch(source)
+	require.NotNil(t, match, "the page must cap one /up body")
+
+	kilobytes, err := strconv.Atoi(string(match[1]))
+	require.NoError(t, err)
+
+	limit := int64(kilobytes) * 1024
+
+	assert.LessOrEqual(t, limit, web.DefaultServerConfig().MaxBodyBytes)
+	assert.LessOrEqual(t, limit, int64(1024*1024), "nginx default client_max_body_size")
+	assert.GreaterOrEqual(t, limit, int64(web.HeaderBytes+web.DataChunkBytes))
 }

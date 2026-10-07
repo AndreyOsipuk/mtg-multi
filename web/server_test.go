@@ -446,6 +446,41 @@ func TestServerKeepsSessionOnDataForGoneStream(t *testing.T) {
 	assert.Equal(t, 1, srv.SessionCount())
 }
 
+// The server takes an /up body up to MaxBodyBytes and refuses a longer one.
+// With the defaults it takes the largest body the bridge page sends (whole
+// frames up to 512 KB).
+func TestServerAcceptsUpBodyUpToMaxBodyBytes(t *testing.T) {
+	// DATA for a stream that is not open is dropped and the session goes on,
+	// so the body size is the only thing under test.
+	frame := web.Encode(web.FrameData, 5, make([]byte, web.DataChunkBytes))
+
+	t.Run("largest page batch with the defaults", func(t *testing.T) {
+		srv, profile := newTestServer(t, nil)
+		token := openSession(t, srv, profile)
+
+		body := bytes.Repeat(frame, 512*1024/len(frame))
+
+		rec := do(srv, carrierRequest("/api/v1/up", token, body))
+		assert.Equal(t, "application/octet-stream", rec.Header().Get("Content-Type"))
+		assert.Equal(t, 1, srv.SessionCount())
+	})
+
+	t.Run("exactly the limit and one frame over it", func(t *testing.T) {
+		srv, profile := newTestServer(t, nil, func(cfg *web.ServerConfig) {
+			cfg.MaxBodyBytes = int64(3 * len(frame))
+		})
+		token := openSession(t, srv, profile)
+
+		rec := do(srv, carrierRequest("/api/v1/up", token, bytes.Repeat(frame, 3)))
+		assert.Equal(t, "application/octet-stream", rec.Header().Get("Content-Type"))
+		assert.Equal(t, 1, srv.SessionCount())
+
+		rec = do(srv, carrierRequest("/api/v1/up", token, bytes.Repeat(frame, 4)))
+		assert.Equal(t, decoyBody, rec.Body.String())
+		assert.Equal(t, 0, srv.SessionCount())
+	})
+}
+
 // countingReader records whether the body was read at all.
 type countingReader struct {
 	read atomic.Int64
