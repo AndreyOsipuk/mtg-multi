@@ -2,12 +2,12 @@ package cli
 
 import (
 	"fmt"
-	"github.com/dolonet/mtg-multi/internal/utils"
 	"net"
 	"strconv"
 	"time"
 
 	"github.com/dolonet/mtg-multi/internal/config"
+	"github.com/dolonet/mtg-multi/internal/utils"
 )
 
 type SimpleRun struct {
@@ -30,6 +30,11 @@ type SimpleRun struct {
 }
 
 func (s *SimpleRun) Run(cli *CLI, version string) error { //nolint: cyclop,funlen
+	// Catch SIGHUP first, as Run does: by default Go terminates on it, and
+	// startup takes seconds (DNS checks, public IP detection). There is no
+	// config file to re-read, so the signal is only caught and ignored.
+	reloadSignals := utils.ReloadSignals()
+
 	conf := &config.Config{}
 
 	var bindHP config.TypeHostPort
@@ -110,7 +115,5 @@ func (s *SimpleRun) Run(cli *CLI, version string) error { //nolint: cyclop,funle
 		return fmt.Errorf("invalid result configuration: %w", err)
 	}
 
-	// There is no config file to re-read; the signal is only caught so that
-	// SIGHUP does not terminate the process.
-	return runProxy(conf, version, utils.ReloadSignals(), nil)
+	return runProxy(conf, version, reloadSignals, nil)
 }
