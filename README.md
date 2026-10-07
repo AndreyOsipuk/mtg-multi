@@ -106,6 +106,10 @@ server {
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_buffering off;
         proxy_read_timeout 60s;
+        # Upload bodies: at least mtg's limit on one /up body (32 MB). The
+        # bridge page sends at most 512 KB per request, but a 413 from here
+        # ends the session.
+        client_max_body_size 32m;
     }
 }
 ```
@@ -116,6 +120,7 @@ Notes:
 
 - `X-Forwarded-For` is the only source of the client address (mtg listens on loopback, so the peer is always 127.0.0.1). It must hold exactly one address. A missing, repeated or comma-separated header is refused with the decoy and logged (at most once a minute), instead of letting the client through as 127.0.0.1, where the allowlist and the blocklist would not see it. With `$proxy_add_x_forwarded_for` this breaks every client that sends its own header, so use `$remote_addr`.
 - The capability in `/?bridge=...` works like a password for the WEB link of that user. Keep it out of logs (`log_format` above) and out of `Referer`.
+- Set `client_max_body_size` at least to mtg's limit on one `/up` body (32 MB), as in the example. The bridge page itself sends at most 512 KB per request, so it also fits nginx's default of 1m, but a proxy limit below that answers 413, and the page treats a failed upload as the end of the session.
 - One user cannot take the whole server: by default a user has at most 4 live sessions and 8 bridge tokens not used yet (`max-sessions-per-user`, `max-pending-per-user`); past that, the user's oldest one gives way.
 
 Everything else — domain fronting, doppelganger, proxy chaining, blocklists, metrics — works exactly as in upstream. See the [upstream README](https://github.com/9seconds/mtg) for details.
@@ -243,6 +248,7 @@ decoy-dir = "/var/www/decoy"
 
 - `X-Forwarded-For` - единственный источник адреса клиента (mtg слушает loopback, соединение всегда от 127.0.0.1). В нём должен быть ровно один адрес: `proxy_set_header X-Forwarded-For $remote_addr`, а не `$proxy_add_x_forwarded_for`. Запрос без пригодного заголовка получает заглушку и пишется в лог (не чаще раза в минуту), а не проходит как 127.0.0.1 мимо allowlist и blocklist.
 - Capability в `/?bridge=...` - это пароль WEB-ссылки пользователя. Не пишите её в access_log (`log_format` без query string, как в примере) и включите `server_tokens off`.
+- `client_max_body_size` - не ниже лимита mtg на одно тело `/up` (32 МБ), как в примере. Сама страница-мост отправляет не больше 512 КБ за запрос и укладывается и в дефолтный 1m nginx, но лимит прокси ниже этого даёт 413, а неудачная отправка для страницы - конец сессии.
 - Один пользователь не займёт весь сервер: по умолчанию у него не больше 4 живых сессий и 8 неиспользованных токенов моста (`max-sessions-per-user`, `max-pending-per-user`), сверх этого вытесняются его же самые старые.
 
 Всё остальное — domain fronting, doppelganger, цепочки прокси, блоклисты, метрики — работает как в оригинале. Подробности в [README upstream](https://github.com/9seconds/mtg).
