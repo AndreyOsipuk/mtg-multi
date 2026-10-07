@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/dolonet/mtg-multi/mtglib"
+	"github.com/dolonet/mtg-multi/internal/acceptretry"
 	"github.com/dolonet/mtg-multi/network"
 )
 
@@ -86,7 +86,7 @@ func (ml *MultiListener) acceptLoop(l net.Listener) {
 		case errors.Is(err, net.ErrClosed):
 			return
 		default:
-			delay = mtglib.AcceptRetryDelay(delay)
+			delay = acceptretry.NextDelay(delay)
 			time.Sleep(delay)
 		}
 	}
