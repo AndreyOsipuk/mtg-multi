@@ -11,15 +11,18 @@
 //
 // Exactly two things are fixed by Telegram Desktop: the capability formula
 // (this file) and the frame format (frame.go). The transport between the page
-// and the server is our own, because we ship the JS client ourselves.
+// and the server is not fixed by Telegram, because the server ships the page
+// itself.
 //
 // Origin: this is the WEB proxy protocol of Telegram Desktop. Its server side
 // was first implemented in the telemt project (https://github.com/telemt/telemt).
-// This package is an independent Go implementation of the same protocol for
-// compatibility. The capability test vectors in capability_test.go are taken
-// from telemt to check that both derive the same values; they are Copyright
-// (c) 2026 Telemt and are used under the TELEMT LICENSE 3.3, whose full text
-// is in web/testdata/LICENSE.telemt.
+// The Go server side here (this package except the bridge page) is written
+// anew after telemt's protocol. The bridge page and its HTML, CSP and
+// Permissions-Policy (bridge.go, bridge/runtime.js) are adapted from telemt,
+// and the capability test vectors in capability_test.go are taken from it.
+// Those parts are Copyright (c) 2026 Telemt and are used under the TELEMT
+// LICENSE 3.3, whose full text is in web/LICENSE.telemt; the adapted files
+// list their changes in their headers.
 package web
 
 import (

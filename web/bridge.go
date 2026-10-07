@@ -1,3 +1,12 @@
+// Portions of this file are adapted from telemt (https://github.com/telemt/telemt),
+// Copyright (c) 2026 Telemt, licensed under the TELEMT LICENSE 3.3 (see
+// web/LICENSE.telemt). This is a modified version, not official Telemt.
+// Adapted: the bridge HTML document, the Content-Security-Policy, the
+// Permissions-Policy and the nonce format (18 random bytes, base64url).
+// Changes: rewritten in Go; the document carries a single script instead of
+// telemt's eight; connect-src is 'self' only (no wss:// carrier); the
+// diagnostic reporter is put into the page only when diagnostics are enabled.
+
 package web
 
 import (
@@ -36,7 +45,30 @@ const PermissionsPolicy = "accelerometer=(), autoplay=(), camera=(), clipboard-r
 	"screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()"
 
 // DefaultBridge renders the bridge page with a one-time token.
-type DefaultBridge struct{}
+type DefaultBridge struct {
+	// Diag puts the diagnostic reporter into the page. Without it the page
+	// never calls the diagnostic endpoint.
+	Diag bool
+}
+
+// noReport is the reporter of a page without diagnostics.
+const noReport = "() => {}"
+
+// diagReport sends a short mark to the diagnostic endpoint. Sending never
+// waits and never interferes with the bridge.
+const diagReport = `(message) => {
+    try {
+      fetch(ORIGIN + '/api/v1/diag', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'text/plain' },
+        body: message,
+        cache: 'no-store',
+        credentials: 'omit',
+      }).catch(() => {});
+    } catch (error) {
+      // Diagnostics must never interfere with the bridge.
+    }
+  }`
 
 // Render returns the document and a policy that allows exactly one script,
 // ours.
@@ -46,11 +78,18 @@ type DefaultBridge struct{}
 // misconfiguration), the browser must not execute anything except the script
 // carrying our one-time nonce. Network requests are allowed to the page's own
 // origin only.
-func (DefaultBridge) Render(host, bootstrapToken string) (string, string) {
+func (b DefaultBridge) Render(host, bootstrapToken string) (string, string) {
 	nonce := randomNonce()
 
-	body := strings.ReplaceAll(bridgeDocument, "__RUNTIME__",
-		strings.ReplaceAll(bridgeRuntime, "__TOKEN__", bootstrapToken))
+	report := noReport
+	if b.Diag {
+		report = diagReport
+	}
+
+	runtime := strings.ReplaceAll(bridgeRuntime, "__REPORT__", report)
+	runtime = strings.ReplaceAll(runtime, "__TOKEN__", bootstrapToken)
+
+	body := strings.ReplaceAll(bridgeDocument, "__RUNTIME__", runtime)
 	body = strings.ReplaceAll(body, "__NONCE__", nonce)
 
 	// The policy is as strict as possible and must include sandbox.
