@@ -136,14 +136,6 @@ func (p *pipe) wait(deadline time.Time) error {
 	}
 }
 
-// buffered сообщает, сколько байт ждёт чтения.
-func (p *pipe) buffered() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return p.buf.Len()
-}
-
 // closeWrite закрывает сторону записи: читатель добёрет остаток и получит EOF
 // (или указанную причину).
 func (p *pipe) closeWrite(err error) {
