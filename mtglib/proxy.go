@@ -315,7 +315,7 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	}
 
 	matchedSecret := set.secrets[result.MatchedIndex]
-	ctx.matchedSecretKey = matchedSecret.Key[:]
+	ctx.matchedSecret = matchedSecret
 	ctx.secretName = set.names[result.MatchedIndex]
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName)
 
@@ -368,7 +368,7 @@ func (p *Proxy) doSecuredHandshake(ctx *streamContext, rewind *connRewind, set *
 	ctx.secured = true
 	ctx.dc = dcIdx
 	ctx.clientConn = cn
-	ctx.matchedSecretKey = set.keys[idx]
+	ctx.matchedSecret = set.secrets[idx]
 	ctx.secretName = set.names[idx]
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName).BindInt("dc", dcIdx)
 
@@ -410,7 +410,7 @@ func (p *Proxy) readSecuredFrame(
 func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
 	// Use the secret key that was matched during the FakeTLS handshake.
 	obfs := obfuscation.Obfuscator{
-		Secret: ctx.matchedSecretKey,
+		Secret: ctx.matchedSecret.Key[:],
 	}
 
 	dc, conn, err := obfs.ReadHandshake(ctx.clientConn)
@@ -645,7 +645,7 @@ func (p *Proxy) trackSession(ctx *streamContext) bool {
 	p.sessions.mu.Lock()
 	defer p.sessions.mu.Unlock()
 
-	if !p.secretSet.Load().sameSecret(ctx.secretName, ctx.matchedSecretKey) {
+	if !p.secretSet.Load().sameSecret(ctx.secretName, ctx.matchedSecret) {
 		return false
 	}
 

@@ -43,10 +43,10 @@ func authenticatedSession(t *testing.T, p *Proxy, name string, secret Secret) *s
 	t.Cleanup(cancel)
 
 	stream := &streamContext{
-		ctx:              ctx,
-		ctxCancel:        cancel,
-		secretName:       name,
-		matchedSecretKey: secret.Key[:],
+		ctx:           ctx,
+		ctxCancel:     cancel,
+		secretName:    name,
+		matchedSecret: secret,
 	}
 
 	require.True(t, p.trackSession(stream))
@@ -76,9 +76,14 @@ func TestNewSecretSet(t *testing.T) {
 	assert.Equal(t, []Secret{a, b, c}, set.secrets)
 	assert.Equal(t, [][]byte{a.Key[:], b.Key[:], c.Key[:]}, set.keys)
 	assert.Equal(t, []string{"a.example.com", "b.example.com"}, set.hostnames)
-	assert.True(t, set.sameSecret("bob", b.Key[:]))
-	assert.False(t, set.sameSecret("bob", a.Key[:]))
-	assert.False(t, set.sameSecret("dave", a.Key[:]))
+	assert.True(t, set.sameSecret("bob", b))
+	assert.False(t, set.sameSecret("bob", a))
+	assert.False(t, set.sameSecret("dave", a))
+
+	// Same key, different host: not the same secret.
+	bMoved := b
+	bMoved.Host = "c.example.com"
+	assert.False(t, set.sameSecret("bob", bMoved))
 }
 
 func TestUpdateSecretsRejectsInvalidSet(t *testing.T) {
@@ -200,10 +205,10 @@ func TestTrackSessionAfterSecretRemoved(t *testing.T) {
 	for name, secret := range map[string]Secret{"alice": alice, "bob": bob} {
 		ctx, cancel := context.WithCancel(context.Background())
 		stream := &streamContext{
-			ctx:              ctx,
-			ctxCancel:        cancel,
-			secretName:       name,
-			matchedSecretKey: secret.Key[:],
+			ctx:           ctx,
+			ctxCancel:     cancel,
+			secretName:    name,
+			matchedSecret: secret,
 		}
 
 		assert.False(t, p.trackSession(stream), name)
@@ -215,6 +220,40 @@ func TestTrackSessionAfterSecretRemoved(t *testing.T) {
 	// brought back into the stats.
 	assert.Nil(t, p.stats.lookup("alice"))
 	assert.Zero(t, p.stats.lookup("bob").connections.Load())
+}
+
+// A handshake that matched the old host of a user must not register a
+// session after an update that only changes the host: the key is the same,
+// but UpdateSecrets closes the sessions of such a user, and a late one would
+// escape the sweep.
+func TestTrackSessionAfterHostChanged(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("old.example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice})
+
+	moved := alice
+	moved.Host = "new.example.com"
+
+	_, err := p.UpdateSecrets(map[string]Secret{"alice": moved})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stale := &streamContext{
+		ctx:           ctx,
+		ctxCancel:     cancel,
+		secretName:    "alice",
+		matchedSecret: alice,
+	}
+	assert.False(t, p.trackSession(stale))
+	assert.Empty(t, p.sessions.sessions)
+	assert.Zero(t, p.stats.lookup("alice").connections.Load())
+
+	// A handshake with the new host is accepted.
+	fresh := authenticatedSession(t, p, "alice", moved)
+	assert.False(t, isClosed(fresh))
 }
 
 func TestUpdateSecretsConcurrentWithSessions(t *testing.T) {
@@ -231,10 +270,10 @@ func TestUpdateSecretsConcurrentWithSessions(t *testing.T) {
 		for range 1000 {
 			ctx, cancel := context.WithCancel(context.Background())
 			stream := &streamContext{
-				ctx:              ctx,
-				ctxCancel:        cancel,
-				secretName:       "alice",
-				matchedSecretKey: alice.Key[:],
+				ctx:           ctx,
+				ctxCancel:     cancel,
+				secretName:    "alice",
+				matchedSecret: alice,
 			}
 
 			if p.trackSession(stream) {
@@ -266,7 +305,7 @@ func tcpPair(t *testing.T) (server, client *net.TCPConn) {
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { ln.Close() }) //nolint: errcheck
 
 	accepted := make(chan net.Conn, 1)
 
@@ -280,7 +319,7 @@ func tcpPair(t *testing.T) (server, client *net.TCPConn) {
 
 	s := <-accepted
 	require.NotNil(t, s)
-	t.Cleanup(func() { s.Close(); c.Close() })
+	t.Cleanup(func() { s.Close(); c.Close() }) //nolint: errcheck
 
 	return s.(*net.TCPConn), c.(*net.TCPConn) //nolint: forcetypeassert
 }
@@ -302,7 +341,7 @@ func TestUpdateSecretsClosesWhileServeConnRewrapsConn(t *testing.T) {
 	server, client := tcpPair(t)
 	stream := newStreamContext(context.Background(), NoopLogger{}, server)
 	stream.secretName = "alice"
-	stream.matchedSecretKey = alice.Key[:]
+	stream.matchedSecret = alice
 	require.True(t, p.trackSession(stream))
 
 	stop := make(chan struct{})

@@ -1,7 +1,6 @@
 package mtglib
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"sort"
@@ -70,14 +69,14 @@ func (s *secretSet) digest() string {
 	return hex.EncodeToString(sum[:])
 }
 
-// sameSecret reports whether name is present in the set with the given key.
-//
-// Only the key is compared: a host-only change does not affect the handshake
-// (same key), and live sessions of such a user are closed by UpdateSecrets.
-func (s *secretSet) sameSecret(name string, key []byte) bool {
-	secret, ok := s.byName[name]
+// sameSecret reports whether name is present in the set with exactly this
+// secret. Both the key and the host are compared: UpdateSecrets closes live
+// sessions of a user whose host has changed, so a handshake that matched the
+// old host must not register a session after the swap either.
+func (s *secretSet) sameSecret(name string, secret Secret) bool {
+	current, ok := s.byName[name]
 
-	return ok && bytes.Equal(secret.Key[:], key)
+	return ok && current == secret
 }
 
 // SecretsUpdate describes the result of Proxy.UpdateSecrets.

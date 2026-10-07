@@ -23,11 +23,11 @@ type streamContext struct {
 	// userStats is the stats entry this session is counted in. It is the one
 	// decremented: after a user is removed and added back, a lookup by name
 	// would find the new entry and drive its counter negative.
-	userStats        *secretStats
-	streamID         string
-	dc               int
-	matchedSecretKey []byte
-	secretName       string
+	userStats     *secretStats
+	streamID      string
+	dc            int
+	matchedSecret Secret
+	secretName    string
 	// secured is true for a secured ("dd") client: plain obfuscated2 without
 	// FakeTLS. Its obfuscated2 handshake is done in doSecuredHandshake, so
 	// ServeConn skips the FakeTLS-specific steps.
