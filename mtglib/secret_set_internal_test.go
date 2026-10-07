@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dolonet/mtg-multi/essentials"
+	"github.com/dolonet/mtg-multi/mtglib/obfuscation"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -442,4 +443,84 @@ func TestSecretsDigest(t *testing.T) {
 	_, err := p.UpdateSecrets(map[string]Secret{"alice": GenerateSecret("example.com"), "bob": bob})
 	require.NoError(t, err)
 	assert.NotEqual(t, before, readDigest())
+}
+
+// securedSession runs a real secured (dd) handshake for secret against the
+// given snapshot of the secrets, the way doFakeTLSHandshake does with
+// [secured] enabled. It returns the stream and the client side of its
+// connection.
+func securedSession(t *testing.T, p *Proxy, set *secretSet, secret Secret) (*streamContext, *net.TCPConn) {
+	t.Helper()
+
+	p.ctx = context.Background()
+	p.logger = NoopLogger{}
+	p.eventStream = &countingEventStream{}
+	p.antiReplayCache = &mapAntiReplayCache{seen: map[string]bool{}}
+	p.securedFrameTimeout = time.Second
+
+	frame := &recordingConn{}
+	_, err := (obfuscation.Obfuscator{Secret: secret.Key[:]}).SendHandshake(frame, 2)
+	require.NoError(t, err)
+
+	server, client := tcpPair(t)
+	_, err = client.Write(frame.buf.Bytes())
+	require.NoError(t, err)
+
+	stream := newStreamContext(context.Background(), NoopLogger{}, essentials.WrapNetConn(server))
+	t.Cleanup(stream.ctxCancel)
+
+	require.NoError(t, p.doSecuredHandshake(stream, newConnRewind(stream.clientConn), set))
+	require.True(t, stream.secured)
+
+	return stream, client
+}
+
+// A dd session is registered under the user whose key matched, with the
+// whole secret of that user from the same snapshot, and is closed when the
+// user is removed. The session's clientConn is the obfuscated2 wrapper, so
+// the close must reach the original connection.
+func TestUpdateSecretsClosesSecuredSession(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("alice.example.com")
+	bob := GenerateSecret("bob.example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice, "bob": bob})
+
+	aliceStream, aliceClient := securedSession(t, p, p.secretSet.Load(), alice)
+	assert.Equal(t, "alice", aliceStream.secretName)
+	assert.Equal(t, alice, aliceStream.matchedSecret)
+	require.True(t, p.trackSession(aliceStream))
+
+	bobStream, _ := securedSession(t, p, p.secretSet.Load(), bob)
+	assert.Equal(t, "bob", bobStream.secretName)
+	require.True(t, p.trackSession(bobStream))
+
+	update, err := p.UpdateSecrets(map[string]Secret{"bob": bob})
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, update.ClosedSessions)
+	assert.True(t, isClosed(aliceStream))
+	assert.False(t, isClosed(bobStream))
+
+	require.NoError(t, aliceClient.SetReadDeadline(time.Now().Add(2*time.Second)))
+	_, err = aliceClient.Read(make([]byte, 1))
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+// A dd handshake that matched a user against the old snapshot must not
+// register a session after the user has been removed.
+func TestTrackSecuredSessionAfterSecretRemoved(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice})
+
+	stream, _ := securedSession(t, p, p.secretSet.Load(), alice)
+
+	_, err := p.UpdateSecrets(map[string]Secret{"bob": GenerateSecret("example.com")})
+	require.NoError(t, err)
+
+	assert.False(t, p.trackSession(stream))
+	assert.Empty(t, p.sessions.sessions)
+	assert.Nil(t, p.stats.lookup("alice"))
 }
