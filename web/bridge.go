@@ -19,6 +19,34 @@ import (
 //go:embed bridge/runtime.js
 var bridgeRuntime string
 
+// servedRuntime is the script as the page carries it. The licence header
+// stays in the source file and in the binary, but is cut from the page sent
+// to the client: a copyright notice of another project in the response would
+// be one more sign of what serves it.
+var servedRuntime = stripLeadingComment(bridgeRuntime)
+
+// stripLeadingComment cuts the first block of "//" lines at the very start of
+// the script, together with the blank lines after it. Nothing else is
+// touched: the rest of the comments and all the code stay as they are.
+func stripLeadingComment(script string) string {
+	rest := script
+
+	for strings.HasPrefix(rest, "//") {
+		end := strings.IndexByte(rest, '\n')
+		if end == -1 {
+			return ""
+		}
+
+		rest = rest[end+1:]
+	}
+
+	if len(rest) == len(script) {
+		return script
+	}
+
+	return strings.TrimLeft(rest, "\r\n")
+}
+
 // bridgeDocument is the page Telegram opens in its webview. It carries
 // nothing extra: the title is neutral and all the logic lives in the script.
 const bridgeDocument = `<!doctype html>
@@ -86,7 +114,7 @@ func (b DefaultBridge) Render(host, bootstrapToken string) (string, string) {
 		report = diagReport
 	}
 
-	runtime := strings.ReplaceAll(bridgeRuntime, "__REPORT__", report)
+	runtime := strings.ReplaceAll(servedRuntime, "__REPORT__", report)
 	runtime = strings.ReplaceAll(runtime, "__TOKEN__", bootstrapToken)
 
 	body := strings.ReplaceAll(bridgeDocument, "__RUNTIME__", runtime)
