@@ -24,7 +24,11 @@ kill -HUP $(pidof mtg-multi)
 systemctl reload mtg-multi
 ```
 
-Write the new config atomically (to a temporary file, then `mv`), so mtg never reads a half-written file.
+Write the new config atomically (to a temporary file, then `mv`), so mtg never reads a half-written file: a truncated file that still parses is applied as is, and every user missing from it is disconnected.
+
+If a new hostname does not resolve, the secrets are still applied and a warning is logged.
+
+Note: `SIGHUP` no longer terminates mtg, both for `run` and `simple-run`, including a foreground process when its terminal is closed. Stop it with `SIGINT` or `SIGTERM`.
 
 **Stats API.** A lightweight HTTP endpoint that shows live per-user traffic.
 
@@ -144,7 +148,11 @@ kill -HUP $(pidof mtg-multi)
 systemctl reload mtg-multi
 ```
 
-Новый конфиг записывайте атомарно (во временный файл, затем `mv`), чтобы mtg не прочитал его наполовину записанным.
+Новый конфиг записывайте атомарно (во временный файл, затем `mv`), чтобы mtg не прочитал его наполовину записанным: обрезанный файл, который всё же разбирается, применяется как есть, и все пользователи, которых в нём нет, отключаются.
+
+Если новый hostname не резолвится, секреты всё равно применяются, в лог пишется предупреждение.
+
+Внимание: `SIGHUP` больше не завершает mtg - ни `run`, ни `simple-run`, в том числе процесс на переднем плане при закрытии терминала. Останавливайте его через `SIGINT` или `SIGTERM`.
 
 **Stats API.** HTTP-эндпоинт с live-статистикой трафика по пользователям.
 
