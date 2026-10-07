@@ -401,7 +401,10 @@ func runProxy(
 	}()
 
 	if readConfig != nil {
-		go watchReload(ctx, reloadSignals, readConfig, proxy, logger.Named("reload"))
+		go watchReload(
+			ctx, reloadSignals, readConfig, proxy,
+			net.DefaultResolver, conf.GetSecrets(), logger.Named("reload"),
+		)
 	}
 
 	return waitAndShutdown(ctx, serveErr, func() {
