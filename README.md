@@ -445,10 +445,12 @@ secured (dd) handshake, which is accepted for WEB streams only and does not
 make the FakeTLS listener accept dd clients.
 
 The server side of this protocol was first implemented in
-[telemt](https://github.com/telemt/telemt). The `web` package is an independent
-Go implementation of the same protocol for compatibility and contains no telemt
-source code; only the capability test vectors are taken from telemt, to check
-that both derive the same values.
+[telemt](https://github.com/telemt/telemt). The bridge page and its HTML, CSP
+and Permissions-Policy (`web/bridge.go`, `web/bridge/runtime.js`) are adapted
+from telemt, and the capability test vectors are taken from it; those parts are
+used under the TELEMT LICENSE 3.3 (see [`web/LICENSE.telemt`](web/LICENSE.telemt)),
+and the adapted files list their changes. The Go server side is written anew
+after telemt's protocol.
 
 ## Command reference
 

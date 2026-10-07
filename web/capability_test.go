@@ -9,11 +9,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The reference vectors come from telemt (config/load/runtime_web.rs), where
-// the WEB server side was implemented first. They prove that our Go code
-// computes exactly the value Telegram Desktop computes: if we diverged by a
-// single byte, the client would just get the decoy instead of the proxy, and
-// debugging that from a "does not connect" symptom is very hard.
+// Test vectors taken from telemt (https://github.com/telemt/telemt),
+// Copyright (c) 2026 Telemt, licensed under the TELEMT LICENSE 3.3; see
+// web/LICENSE.telemt. They come from config/load/runtime_web.rs
+// (later config/load/runtime_web/tests.rs), where the WEB server side was
+// implemented first.
+//
+// They prove that our Go code computes exactly the value Telegram Desktop
+// computes: if we diverged by a single byte, the client would just get the
+// decoy instead of the proxy, and debugging that from a "does not connect"
+// symptom is very hard.
 func TestDeriveCapabilityReferenceVectors(t *testing.T) {
 	secret, err := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
 	require.NoError(t, err)

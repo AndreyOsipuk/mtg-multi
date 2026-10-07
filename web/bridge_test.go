@@ -40,3 +40,17 @@ func TestDefaultBridgeRender(t *testing.T) {
 		assert.NotEqual(t, csp, second)
 	})
 }
+
+// Without diagnostics the page carries no reporter at all: it never calls the
+// diagnostic endpoint, which would be one more request per event and a
+// recognizable pattern.
+func TestDefaultBridgeDiag(t *testing.T) {
+	off, _ := web.DefaultBridge{}.Render("proxy.example.com", "TOKEN-VALUE")
+	assert.NotContains(t, off, "/api/v1/diag")
+	assert.NotContains(t, off, "__REPORT__")
+	assert.Contains(t, off, "const report = () => {};")
+
+	on, _ := web.DefaultBridge{Diag: true}.Render("proxy.example.com", "TOKEN-VALUE")
+	assert.Contains(t, on, "/api/v1/diag")
+	assert.NotContains(t, on, "__REPORT__")
+}

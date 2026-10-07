@@ -109,7 +109,7 @@ func Setup(settings Settings, secrets map[string][]byte, handle func(*Stream)) (
 	cfg := DefaultServerConfig()
 	cfg.VHosts = []VHost{{Host: host, Profiles: table, Decoy: newDecoy(settings.DecoyDir), SecretMode: mode}}
 	cfg.TrustedProxyCIDRs = trusted
-	cfg.Bridge = DefaultBridge{}
+	cfg.Bridge = DefaultBridge{Diag: settings.Diag}
 	cfg.Handle = handle
 
 	if settings.MaxSessions > 0 {
