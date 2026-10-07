@@ -266,7 +266,7 @@ func tcpPair(t *testing.T) (server, client *net.TCPConn) {
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { ln.Close() }) //nolint: errcheck
 
 	accepted := make(chan net.Conn, 1)
 
@@ -280,7 +280,7 @@ func tcpPair(t *testing.T) (server, client *net.TCPConn) {
 
 	s := <-accepted
 	require.NotNil(t, s)
-	t.Cleanup(func() { s.Close(); c.Close() })
+	t.Cleanup(func() { s.Close(); c.Close() }) //nolint: errcheck
 
 	return s.(*net.TCPConn), c.(*net.TCPConn) //nolint: forcetypeassert
 }
