@@ -94,28 +94,16 @@ func TestParseAllRejects(t *testing.T) {
 			body := []byte{0x02, 0, 0, 1, length[0], length[1], length[2], length[3], 'x'}
 
 			assert.NotPanics(t, func() {
-				_, err := web.ParseAll(body, web.Limits{MaxFramesPerBody: 1, MaxFramePayloadLen: math.MaxInt})
+				_, err := web.ParseAll(body, web.Limits{MaxFramePayloadLen: math.MaxInt})
 				assert.Error(t, err)
 			})
-			assert.False(t, web.ValidateHello(body, web.Limits{MaxFramesPerBody: 1, MaxFramePayloadLen: math.MaxInt}))
+			assert.False(t, web.ValidateHello(body, web.Limits{MaxFramePayloadLen: math.MaxInt}))
 		}
 	})
 
 	t.Run("negative limit", func(t *testing.T) {
-		_, err := web.ParseAll(web.Encode(web.FrameOpen, 1, nil), web.Limits{MaxFramesPerBody: 1, MaxFramePayloadLen: -1})
+		_, err := web.ParseAll(web.Encode(web.FrameOpen, 1, nil), web.Limits{MaxFramePayloadLen: -1})
 		assert.ErrorIs(t, err, web.ErrPayloadLimit)
-	})
-
-	t.Run("too many frames", func(t *testing.T) {
-		tight := web.Limits{MaxFramesPerBody: 2, MaxFramePayloadLen: 16}
-
-		var body []byte
-		for range 3 {
-			body = append(body, web.Encode(web.FrameOpen, 1, nil)...)
-		}
-
-		_, err := web.ParseAll(body, tight)
-		assert.ErrorIs(t, err, web.ErrTooManyFrames)
 	})
 }
 
