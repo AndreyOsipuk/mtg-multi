@@ -450,7 +450,11 @@ and Permissions-Policy (`web/bridge.go`, `web/bridge/runtime.js`) are adapted
 from telemt, and the capability test vectors are taken from it; those parts are
 used under the TELEMT LICENSE 3.3 (see [`web/LICENSE.telemt`](web/LICENSE.telemt)),
 and the adapted files list their changes. The Go server side is written anew
-after telemt's protocol.
+after telemt's protocol. For operators: the bridge page your server sends to
+clients is adapted from telemt and licensed under the TELEMT LICENSE 3.3
+([`web/LICENSE.telemt`](web/LICENSE.telemt)), so you may state this in your
+service description (section 7 of that licence recommends such attribution for
+a public network service).
 
 ## Command reference
 

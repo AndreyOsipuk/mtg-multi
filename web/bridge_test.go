@@ -1,11 +1,14 @@
 package web_test
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/mhsanaei/mtg-multi/web"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDefaultBridgeRender(t *testing.T) {
@@ -53,4 +56,35 @@ func TestDefaultBridgeDiag(t *testing.T) {
 	on, _ := web.DefaultBridge{Diag: true}.Render("proxy.example.com", "TOKEN-VALUE")
 	assert.Contains(t, on, "/api/v1/diag")
 	assert.NotContains(t, on, "__REPORT__")
+}
+
+// The script is adapted from telemt, and the page sent to the client is a
+// copy of it: it must carry the same notice as web/bridge/runtime.js, that is
+// the copyright, the licence, the note that this is a modified version and
+// the list of changes.
+func TestDefaultBridgeKeepsLicenceHeader(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("bridge", "runtime.js"))
+	require.NoError(t, err)
+
+	var header []string
+
+	for line := range strings.Lines(string(source)) {
+		if !strings.HasPrefix(line, "//") {
+			break
+		}
+
+		header = append(header, line)
+	}
+
+	notice := strings.Join(header, "")
+	require.Contains(t, notice, "Copyright (c) 2026 Telemt")
+	require.Contains(t, notice, "TELEMT LICENSE 3.3")
+	require.Contains(t, notice, "This is a modified version, not official Telemt.")
+	require.Contains(t, notice, "Changes:")
+
+	for _, diag := range []bool{false, true} {
+		body, _ := web.DefaultBridge{Diag: diag}.Render("proxy.example.com", "TOKEN-VALUE")
+
+		assert.Contains(t, body, notice, "diag=%v", diag)
+	}
 }
