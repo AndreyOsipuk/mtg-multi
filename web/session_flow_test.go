@@ -24,7 +24,7 @@ func drainFrames(t *testing.T, session *web.Session, wait time.Duration) []web.F
 		return nil
 	}
 
-	frames, err := web.ParseAll(body, web.Limits{MaxFramesPerBody: 1 << 20, MaxFramePayloadLen: web.DataChunkBytes})
+	frames, err := web.ParseAll(body, web.DefaultLimits())
 	require.NoError(t, err)
 
 	return frames

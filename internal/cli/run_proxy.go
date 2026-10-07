@@ -441,6 +441,13 @@ func runProxy(
 
 	if err := waitAndShutdown(ctx, serveErr, func() {
 		listener.Close() //nolint: errcheck
+		// WEB first: closing its sessions ends every WEB stream, so the
+		// proxy does not wait in Shutdown for handlers whose transport is
+		// still open.
+		if webServer != nil {
+			webServer.Close()
+		}
+
 		proxy.Shutdown()
 	}); err != nil {
 		return err
