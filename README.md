@@ -72,6 +72,50 @@ public-ipv4 = "1.2.3.4"
 public-ipv6 = "2001:db8::1"
 ```
 
+**WEB mode.** MTProto inside a real HTTPS session, compatible with the WEB proxy type of Telegram Desktop (`tg://webproxy` links). mtg serves plain HTTP on loopback; a reverse proxy with a real certificate terminates TLS in front of it. Everyone who is not a client gets the static decoy site. Users and secrets are the same as for regular MTProto, only the link differs. Disabled by default:
+
+```toml
+[web]
+bind-to = "127.0.0.1:18080"
+host = "proxy.example.com"
+decoy-dir = "/var/www/decoy"
+```
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name proxy.example.com;
+    ssl_certificate     /etc/letsencrypt/live/proxy.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/proxy.example.com/privkey.pem;
+
+    # The bridge link carries the user's capability in the query string, and
+    # the default access log would store it. Log without the query string, or
+    # turn the log off for this server.
+    log_format no_query '$remote_addr [$time_local] "$request_method $uri" $status';
+    access_log /var/log/nginx/proxy.access.log no_query;
+
+    # The decoy error pages say "nginx" without a version.
+    server_tokens off;
+
+    location / {
+        proxy_pass http://127.0.0.1:18080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        # Exactly one address. Not $proxy_add_x_forwarded_for: it appends to
+        # whatever the client sent, and mtg refuses such requests.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_buffering off;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+Notes:
+
+- `X-Forwarded-For` is the only source of the client address (mtg listens on loopback, so the peer is always 127.0.0.1). It must hold exactly one address. A missing, repeated or comma-separated header is refused with the decoy and logged (at most once a minute), instead of letting the client through as 127.0.0.1, where the allowlist and the blocklist would not see it. With `$proxy_add_x_forwarded_for` this breaks every client that sends its own header, so use `$remote_addr`.
+- The capability in `/?bridge=...` works like a password for the WEB link of that user. Keep it out of logs (`log_format` above) and out of `Referer`.
+- One user cannot take the whole server: by default a user has at most 4 live sessions and 8 bridge tokens not used yet (`max-sessions-per-user`, `max-pending-per-user`); past that, the user's oldest one gives way.
+
 Everything else — domain fronting, doppelganger, proxy chaining, blocklists, metrics — works exactly as in upstream. See the [upstream README](https://github.com/9seconds/mtg) for details.
 
 ## Quick start
@@ -181,6 +225,21 @@ A и B остаются на 1. Оставшийся бюджет 98 делит�
 public-ipv4 = "1.2.3.4"
 public-ipv6 = "2001:db8::1"
 ```
+
+**Режим WEB.** MTProto внутри настоящей HTTPS-сессии, совместим с типом прокси WEB в Telegram Desktop (ссылки `tg://webproxy`). mtg отдаёт простой HTTP на loopback, TLS с настоящим сертификатом терминирует reverse proxy перед ним. Всем, кто не является клиентом, отдаётся статический сайт-заглушка. Пользователи и секреты те же, что для обычного MTProto, отличается только ссылка. По умолчанию выключен:
+
+```toml
+[web]
+bind-to = "127.0.0.1:18080"
+host = "proxy.example.com"
+decoy-dir = "/var/www/decoy"
+```
+
+Пример nginx - в английской части выше. Важно:
+
+- `X-Forwarded-For` - единственный источник адреса клиента (mtg слушает loopback, соединение всегда от 127.0.0.1). В нём должен быть ровно один адрес: `proxy_set_header X-Forwarded-For $remote_addr`, а не `$proxy_add_x_forwarded_for`. Запрос без пригодного заголовка получает заглушку и пишется в лог (не чаще раза в минуту), а не проходит как 127.0.0.1 мимо allowlist и blocklist.
+- Capability в `/?bridge=...` - это пароль WEB-ссылки пользователя. Не пишите её в access_log (`log_format` без query string, как в примере) и включите `server_tokens off`.
+- Один пользователь не займёт весь сервер: по умолчанию у него не больше 4 живых сессий и 8 неиспользованных токенов моста (`max-sessions-per-user`, `max-pending-per-user`), сверх этого вытесняются его же самые старые.
 
 Всё остальное — domain fronting, doppelganger, цепочки прокси, блоклисты, метрики — работает как в оригинале. Подробности в [README upstream](https://github.com/9seconds/mtg).
 
