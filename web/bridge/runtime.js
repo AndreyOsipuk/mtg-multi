@@ -39,6 +39,15 @@
   // How long we wait for the first frame from Telegram. Without it the bridge
   // is useless.
   const HELLO_WAIT_MS = 15000;
+  // The largest /up body, in bytes and in frames. Frames that do not fit wait
+  // for the next request. Both stay within the server limits (MaxBodyBytes,
+  // MaxFramesPerBody), and the size also stays below nginx's default
+  // client_max_body_size (1m), so a burst of uploads does not depend on the
+  // proxy settings: a body over a limit gets 413 or a protocol error, and a
+  // failed /up ends the bridge. One frame is at most 64 KB plus its header,
+  // so it always fits.
+  const MAX_UP_BYTES = 512 * 1024;
+  const MAX_UP_FRAMES = 256;
 
   let port = null;
   let closed = false;
@@ -119,18 +128,31 @@
   };
 
   // Client frames are accumulated and sent in batches: one POST per small
-  // frame would turn ordinary chatting into a flood of requests.
+  // frame would turn ordinary chatting into a flood of requests. A batch
+  // takes whole frames, in order, up to MAX_UP_BYTES and MAX_UP_FRAMES; the
+  // rest go in the next request of the same loop.
+  const takeBatch = () => {
+    let count = 0;
+    let total = 0;
+
+    while (count < pending.length && count < MAX_UP_FRAMES) {
+      const size = pending[count].length;
+      if (count > 0 && total + size > MAX_UP_BYTES) break;
+
+      total += size;
+      count++;
+    }
+
+    return { batch: pending.splice(0, count), total };
+  };
+
   const flush = async () => {
     if (flushing || closed || !sessionReady) return;
     flushing = true;
 
     try {
       while (pending.length > 0 && !closed) {
-        const batch = pending;
-        pending = [];
-
-        let total = 0;
-        for (const frame of batch) total += frame.length;
+        const { batch, total } = takeBatch();
 
         const body = new Uint8Array(total);
         let offset = 0;

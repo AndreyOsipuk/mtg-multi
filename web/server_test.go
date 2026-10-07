@@ -214,6 +214,55 @@ func TestServerEndToEnd(t *testing.T) {
 	assert.Equal(t, []byte("pong"), frames[0].Payload)
 }
 
+// The server takes the largest /up body the bridge page sends (whole frames
+// up to 512 KB, at most 256 frames) and a body of exactly MaxBodyBytes, and
+// refuses a longer one.
+func TestServerAcceptsUpBodyUpToMaxBodyBytes(t *testing.T) {
+	discard := func(stream *web.Stream) {
+		io.Copy(io.Discard, stream) //nolint: errcheck
+	}
+
+	upOK := func(t *testing.T, srv *web.Server, token string, body []byte) {
+		t.Helper()
+
+		rec := do(srv, carrierRequest("/api/v1/up", token, body))
+		require.Equal(t, "application/octet-stream", rec.Header().Get("Content-Type"))
+		require.Equal(t, 1, srv.SessionCount())
+	}
+
+	full := web.Encode(web.FrameData, 1, make([]byte, web.DataChunkBytes))
+
+	t.Run("largest page batches with the defaults", func(t *testing.T) {
+		srv, profile := newTestServer(t, discard)
+		token := openSession(t, srv, profile)
+
+		upOK(t, srv, token, web.Encode(web.FrameOpen, 1, nil))
+		upOK(t, srv, token, bytes.Repeat(full, 512*1024/len(full)))
+
+		many := web.Encode(web.FrameOpen, 3, nil)
+		for range web.DefaultLimits().MaxFramesPerBody - 1 {
+			many = append(many, web.Encode(web.FrameData, 3, []byte{1})...)
+		}
+
+		upOK(t, srv, token, many)
+	})
+
+	t.Run("exactly the limit and one frame over it", func(t *testing.T) {
+		small := web.Encode(web.FrameData, 1, []byte("data"))
+
+		srv, profile := newTestServer(t, discard, func(cfg *web.ServerConfig) {
+			cfg.MaxBodyBytes = int64(3 * len(small))
+		})
+		token := openSession(t, srv, profile)
+
+		upOK(t, srv, token, web.Encode(web.FrameOpen, 1, nil))
+		upOK(t, srv, token, bytes.Repeat(small, 3))
+
+		rec := do(srv, carrierRequest("/api/v1/up", token, bytes.Repeat(small, 4)))
+		assert.Equal(t, decoyBody, rec.Body.String())
+	})
+}
+
 // The client IP is taken from X-Forwarded-For only when it comes from a
 // trusted proxy, i.e. nginx on localhost. Otherwise anyone could assign
 // themselves a foreign address and bypass per-address limits.

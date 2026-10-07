@@ -432,9 +432,19 @@ server {
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_buffering off;
         proxy_read_timeout 60s;
+        # Upload bodies: at least mtg-multi's limit on one /up body (2 MB).
+        # The bridge page sends at most 512 KB per request, but a 413 from
+        # here ends the session.
+        client_max_body_size 2m;
     }
 }
 ```
+
+Set `client_max_body_size` at least to the server's limit on one `/up` body
+(2 MB), as in the example. The bridge page itself sends at most 512 KB and 256
+frames per request, so it also fits nginx's default of 1m, but a proxy limit
+below that answers 413, and the page treats a failed upload as the end of the
+session.
 
 Users and secrets are the same as for regular MTProto; only the link differs:
 `tg://webproxy?server=proxy.example.com&secret=dd<32 hex chars of the key>`.
