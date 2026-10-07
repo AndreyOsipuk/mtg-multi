@@ -1,11 +1,14 @@
 package web_test
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/dolonet/mtg-multi/web"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDefaultBridgeRender(t *testing.T) {
@@ -53,4 +56,24 @@ func TestDefaultBridgeDiag(t *testing.T) {
 	on, _ := web.DefaultBridge{Diag: true}.Render("proxy.example.com", "TOKEN-VALUE")
 	assert.Contains(t, on, "/api/v1/diag")
 	assert.NotContains(t, on, "__REPORT__")
+}
+
+// The licence header of the adapted script stays in the source, but the page
+// sent to the client does not carry it, nor the name of the project.
+func TestDefaultBridgeStripsLicenceHeader(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("bridge", "runtime.js"))
+	require.NoError(t, err)
+	require.Contains(t, string(source), "Portions of this file are adapted from telemt")
+
+	for _, diag := range []bool{false, true} {
+		body, _ := web.DefaultBridge{Diag: diag}.Render("proxy.example.com", "TOKEN-VALUE")
+
+		assert.NotContains(t, strings.ToLower(body), "telemt")
+		assert.NotContains(t, body, "Portions of this file")
+		assert.NotContains(t, body, "LICENSE")
+		// The code itself is intact.
+		assert.Contains(t, body, "'use strict';")
+		assert.Contains(t, body, "tproxy-init")
+		assert.Contains(t, body, "})();")
+	}
 }
