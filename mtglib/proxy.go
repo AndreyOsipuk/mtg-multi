@@ -45,6 +45,9 @@ type Proxy struct {
 	ddShapeDelayMaxMs int
 	ddShapeFragBytes  int
 
+	// serverHelloMSS > 0 - дробить ServerHello FakeTLS (см. server_hello_mss.go).
+	serverHelloMSS int
+
 	stats           *ProxyStats
 	secretSet       atomic.Pointer[secretSet]
 	sessions        *sessionRegistry
@@ -333,7 +336,19 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	gangerNoise := p.doppelGanger.NoiseParams()
 	noiseParams := fake.NoiseParams{Mean: gangerNoise.Mean, Jitter: gangerNoise.Jitter}
 
-	if err := fake.SendServerHello(ctx.clientConn, matchedSecret.Key[:], result.Hello, noiseParams); err != nil {
+	// ServerHello - единственный ответ сервера в рукопожатии FakeTLS, по нему
+	// ТСПУ и узнаёт mtg. С client-mss он уходит мелкими сегментами прямо в
+	// исходный TCP-сокет; у dd ответа на рукопожатие нет вовсе.
+	var helloWriter io.Writer = ctx.clientConn
+	if p.serverHelloMSS > 0 {
+		helloWriter = fragmentedWriter{
+			conn:     ctx.rawConn,
+			mss:      p.serverHelloMSS,
+			deadline: time.Now().Add(p.handshakeTimeout),
+		}
+	}
+
+	if err := fake.SendServerHello(helloWriter, matchedSecret.Key[:], result.Hello, noiseParams); err != nil {
 		p.logger.InfoError("cannot send welcome packet", err)
 		return false
 	}
@@ -606,6 +621,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		ddShapeDelayMinMs: opts.getDDShapeDelayMinMs(),
 		ddShapeDelayMaxMs: opts.getDDShapeDelayMaxMs(),
 		ddShapeFragBytes:  opts.getDDShapeFragBytes(),
+		serverHelloMSS:    opts.ServerHelloMSS,
 	}
 
 	proxy.secretSet.Store(set)

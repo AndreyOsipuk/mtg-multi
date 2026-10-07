@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -35,8 +36,13 @@ func (l Listener) Accept() (net.Conn, error) {
 	}
 }
 
-func NewListener(bindTo string, bufferSize int) (net.Listener, error) {
-	base, err := net.Listen("tcp", bindTo)
+// NewListener открывает слушающий сокет. listenerMSS > 0 ставит на него
+// TCP_MAXSEG (только Linux): этот MSS объявляется клиенту в SYN-ACK и
+// ограничивает размер сегментов к клиенту на всё соединение.
+func NewListener(bindTo string, bufferSize int, listenerMSS int) (net.Listener, error) {
+	lc := net.ListenConfig{Control: network.ListenControlMSS(listenerMSS)}
+
+	base, err := lc.Listen(context.Background(), "tcp", bindTo)
 	if err != nil {
 		return nil, fmt.Errorf("cannot build a base listener: %w", err)
 	}

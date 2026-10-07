@@ -72,6 +72,10 @@ type tomlConfig struct {
 		DNS             string   `toml:"dns" json:"dns,omitempty"`
 		Proxies         []string `toml:"proxies" json:"proxies,omitempty"`
 		TCPNotSentLowat string   `toml:"tcp-not-sent-lowat" json:"tcpNotSentLowat,omitempty"`
+		ClientMSS       uint     `toml:"client-mss" json:"clientMss,omitempty"`
+		// Указатель отличает явный 0 («не поднимать MSS после ServerHello»)
+		// от отсутствующего ключа (умолчание 1400).
+		ClientMSSBulk *uint `toml:"client-mss-bulk" json:"clientMssBulk,omitempty"`
 	} `toml:"network" json:"network,omitempty"`
 	APIBindTo string `toml:"api-bind-to" json:"apiBindTo,omitempty"`
 	Throttle  struct {

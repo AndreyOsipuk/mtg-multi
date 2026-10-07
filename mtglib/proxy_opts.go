@@ -243,6 +243,13 @@ type ProxyOpts struct {
 	// DDShapeFragBytes is the maximum fragment size for the first secured
 	// server-to-client write.
 	DDShapeFragBytes int
+
+	// ServerHelloMSS > 0 - ServerHello FakeTLS уходит клиенту сегментами с
+	// полезной нагрузкой как при MSS = ServerHelloMSS (только Linux), дальше
+	// соединение работает с обычным MSS. 0 - выключено.
+	//
+	// This is an optional setting.
+	ServerHelloMSS int
 }
 
 func (p ProxyOpts) getDDShapeDelayMinMs() int {

@@ -97,6 +97,14 @@ public-ipv4 = "1.2.3.4"
 public-ipv6 = "2001:db8::1"
 ```
 
+**Small-segment ServerHello (Linux).** Some DPI boxes recognise the FakeTLS ServerHello sent in full-size TCP segments. `client-mss` splits only the ServerHello into segments as if MSS were `client-mss`; the rest of the session uses `client-mss-bulk`, set as `TCP_MAXSEG` on the listening socket (Linux cannot raise the MSS of an established connection). `client-mss`: 0 (off) or 48..1460; `client-mss-bulk`: 0 or 536..65495, default 1400; 0 keeps the whole session at `client-mss` (then `client-mss` >= 88). Read at start only.
+
+```toml
+[network]
+client-mss = 92
+client-mss-bulk = 1400
+```
+
 Everything else — domain fronting, doppelganger, proxy chaining, blocklists, metrics — works exactly as in upstream. See the [upstream README](https://github.com/9seconds/mtg) for details.
 
 ## Quick start
@@ -230,6 +238,14 @@ A и B остаются на 1. Оставшийся бюджет 98 делит�
 ```toml
 public-ipv4 = "1.2.3.4"
 public-ipv6 = "2001:db8::1"
+```
+
+**Мелкие сегменты для ServerHello (Linux).** Часть DPI узнаёт ServerHello FakeTLS, отправленный крупными TCP-сегментами. `client-mss` дробит только ServerHello на сегменты как при MSS = `client-mss`; остальная сессия идёт с `client-mss-bulk`, который ставится как `TCP_MAXSEG` на слушающий сокет (поднять MSS установленного соединения в Linux нельзя). `client-mss`: 0 (выкл) или 48..1460; `client-mss-bulk`: 0 или 536..65495, по умолчанию 1400; 0 - вся сессия на `client-mss` (тогда `client-mss` >= 88). Читается только при старте.
+
+```toml
+[network]
+client-mss = 92
+client-mss-bulk = 1400
 ```
 
 Всё остальное — domain fronting, doppelganger, цепочки прокси, блоклисты, метрики — работает как в оригинале. Подробности в [README upstream](https://github.com/9seconds/mtg).
