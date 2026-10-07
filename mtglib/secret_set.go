@@ -2,7 +2,10 @@ package mtglib
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -53,7 +56,24 @@ func newSecretSet(secrets map[string]Secret) *secretSet {
 	return set
 }
 
+// digest is sha256 of "name=secret(hex)" lines in name order joined with \n.
+// An external sync computes the same from its config to check that a reload
+// has been applied completely: key changes are invisible by names alone.
+func (s *secretSet) digest() string {
+	lines := make([]string, len(s.names))
+	for i, name := range s.names {
+		lines[i] = name + "=" + s.secrets[i].Hex()
+	}
+
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+
+	return hex.EncodeToString(sum[:])
+}
+
 // sameSecret reports whether name is present in the set with the given key.
+//
+// Only the key is compared: a host-only change does not affect the handshake
+// (same key), and live sessions of such a user are closed by UpdateSecrets.
 func (s *secretSet) sameSecret(name string, key []byte) bool {
 	secret, ok := s.byName[name]
 

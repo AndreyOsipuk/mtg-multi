@@ -31,6 +31,9 @@ type ProxyStats struct {
 	throttleLimit    int64
 	throttleInterval time.Duration
 	throttleActive   atomic.Bool
+
+	// secretsDigest is the fingerprint of the secret set (see secretSet.digest).
+	secretsDigest atomic.Value // string
 }
 
 // NewProxyStats creates a new ProxyStats instance.
@@ -148,7 +151,20 @@ func (s *ProxyStats) CanConnect(name string) bool {
 		return true
 	}
 
-	return s.getOrCreate(name).connections.Load() < cap
+	// lookup, not getOrCreate: do not bring back a user removed by a reload;
+	// its connection is rejected by trackSession anyway.
+	st := s.lookup(name)
+	if st == nil {
+		return true
+	}
+
+	return st.connections.Load() < cap
+}
+
+// SetSecretsDigest publishes the fingerprint of the current secret set in
+// /stats, so an external sync can check that a reload has been applied.
+func (s *ProxyStats) SetSecretsDigest(digest string) {
+	s.secretsDigest.Store(digest)
 }
 
 // startThrottleLoop runs a background goroutine that recomputes per-user
@@ -249,6 +265,9 @@ type StatsResponse struct {
 	TotalConnections int64                    `json:"total_connections"`
 	Throttle         *ThrottleJSON            `json:"throttle,omitempty"`
 	Users            map[string]UserStatsJSON `json:"users"`
+	// SecretsSHA256 is sha256 of "name=secret(hex)" lines sorted by name and
+	// joined with \n. It changes on every applied key change, not only names.
+	SecretsSHA256 string `json:"secrets_sha256,omitempty"`
 }
 
 // ThrottleJSON is the throttle portion of the stats JSON response.
@@ -320,6 +339,10 @@ func (s *ProxyStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		TotalConnections: totalConns,
 		Throttle:         throttle,
 		Users:            users,
+	}
+
+	if digest, ok := s.secretsDigest.Load().(string); ok {
+		resp.SecretsSHA256 = digest
 	}
 
 	w.Header().Set("Content-Type", "application/json")

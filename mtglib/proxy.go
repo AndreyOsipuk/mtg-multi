@@ -89,7 +89,7 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	}
 
 	stop := context.AfterFunc(ctx, func() {
-		ctx.Close()
+		ctx.closeFromOutside()
 	})
 	defer stop()
 
@@ -143,7 +143,7 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 
 	p.stats.UpdateLastSeen(ctx.secretName)
 
-	defer p.stats.OnDisconnect(ctx.secretName)
+	defer ctx.userStats.connections.Add(-1)
 
 	// FakeTLS specifics: the doppelganger wrapper and a separate obfuscated2
 	// handshake inside the unwrapped TLS stream. A secured client has already
@@ -612,6 +612,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	}
 
 	proxy.secretSet.Store(set)
+	stats.SetSecretsDigest(set.digest())
 	proxy.doppelGanger.Run()
 
 	if opts.AutoUpdate {
@@ -649,7 +650,8 @@ func (p *Proxy) trackSession(ctx *streamContext) bool {
 	}
 
 	p.sessions.add(ctx)
-	p.stats.OnConnect(ctx.secretName)
+	ctx.userStats = p.stats.getOrCreate(ctx.secretName)
+	ctx.userStats.connections.Add(1)
 
 	return true
 }
@@ -685,6 +687,7 @@ func (p *Proxy) UpdateSecrets(secrets map[string]Secret) (SecretsUpdate, error) 
 	p.sessions.mu.Lock()
 
 	prev := p.secretSet.Swap(next)
+	p.stats.SetSecretsDigest(next.digest())
 
 	for _, name := range prev.names {
 		newSecret, ok := next.byName[name]
@@ -719,7 +722,7 @@ func (p *Proxy) UpdateSecrets(secrets map[string]Secret) (SecretsUpdate, error) 
 	}
 
 	for _, ctx := range toClose {
-		ctx.Close()
+		ctx.closeFromOutside()
 	}
 
 	update.ClosedSessions = len(toClose)

@@ -2,7 +2,17 @@ package mtglib
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/dolonet/mtg-multi/essentials"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -248,4 +258,149 @@ func TestUpdateSecretsConcurrentWithSessions(t *testing.T) {
 	<-done
 
 	assert.Empty(t, p.sessions.sessions)
+}
+
+// tcpPair returns a real TCP pair: newStreamContext needs a TCP address.
+func tcpPair(t *testing.T) (server, client *net.TCPConn) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+
+	accepted := make(chan net.Conn, 1)
+
+	go func() {
+		conn, _ := ln.Accept()
+		accepted <- conn
+	}()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+
+	s := <-accepted
+	require.NotNil(t, s)
+	t.Cleanup(func() { s.Close(); c.Close() })
+
+	return s.(*net.TCPConn), c.(*net.TCPConn) //nolint: forcetypeassert
+}
+
+type wrappedConn struct {
+	essentials.Conn
+}
+
+// UpdateSecrets used to close a session with ctx.Close(), which reads
+// clientConn/telegramConn while ServeConn replaces them with wrappers: a data
+// race on an interface value that can crash the process. Now only the
+// original connection is closed. go test -race catches the old behaviour.
+func TestUpdateSecretsClosesWhileServeConnRewrapsConn(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice})
+
+	server, client := tcpPair(t)
+	stream := newStreamContext(context.Background(), NoopLogger{}, server)
+	stream.secretName = "alice"
+	stream.matchedSecretKey = alice.Key[:]
+	require.True(t, p.trackSession(stream))
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				// This is how ServeConn wraps the connection after registration.
+				stream.clientConn = wrappedConn{Conn: stream.clientConn}
+				stream.telegramConn = wrappedConn{Conn: server}
+			}
+		}
+	}()
+
+	update, err := p.UpdateSecrets(map[string]Secret{"bob": GenerateSecret("example.com")})
+	require.NoError(t, err)
+	close(stop)
+	<-done
+
+	assert.Equal(t, 1, update.ClosedSessions)
+	assert.True(t, isClosed(stream))
+
+	// The original connection is closed: the client sees EOF.
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(2*time.Second)))
+	_, err = client.Read(make([]byte, 1))
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+// A user is removed, added back by the next reload, and only then its old
+// sessions finish: the counter of the new entry used to go negative.
+func TestReaddedUserCountersStayConsistent(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("example.com")
+	bob := GenerateSecret("example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice, "bob": bob})
+
+	old := authenticatedSession(t, p, "alice", alice)
+
+	_, err := p.UpdateSecrets(map[string]Secret{"bob": bob})
+	require.NoError(t, err)
+	_, err = p.UpdateSecrets(map[string]Secret{"alice": alice, "bob": bob})
+	require.NoError(t, err)
+
+	// This is how the old session finishes in ServeConn.
+	old.userStats.connections.Add(-1)
+	p.sessions.remove(old)
+
+	assert.Zero(t, p.stats.lookup("alice").connections.Load())
+}
+
+// With throttling enabled, CanConnect used getOrCreate and brought a removed
+// user back into /stats.
+func TestCanConnectDoesNotRecreateForgottenUser(t *testing.T) {
+	t.Parallel()
+
+	stats := NewProxyStats()
+	stats.SetThrottle(10, time.Second)
+	stats.PreRegister("alice")
+	stats.throttleCaps["alice"] = 1
+	stats.Forget("alice")
+
+	assert.True(t, stats.CanConnect("alice"))
+	assert.Nil(t, stats.lookup("alice"))
+}
+
+func TestSecretsDigest(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("example.com")
+	bob := GenerateSecret("example.com")
+	p := newUpdateTestProxy(map[string]Secret{"bob": bob, "alice": alice})
+	p.stats.SetSecretsDigest(p.secretSet.Load().digest())
+
+	want := sha256.Sum256([]byte("alice=" + alice.Hex() + "\nbob=" + bob.Hex()))
+	assert.Equal(t, hex.EncodeToString(want[:]), p.secretSet.Load().digest())
+
+	readDigest := func() string {
+		rec := httptest.NewRecorder()
+		p.stats.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+
+		var resp StatsResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+
+		return resp.SecretsSHA256
+	}
+
+	before := readDigest()
+	assert.Equal(t, hex.EncodeToString(want[:]), before)
+
+	// Same names, another key: the fingerprint must change.
+	_, err := p.UpdateSecrets(map[string]Secret{"alice": GenerateSecret("example.com"), "bob": bob})
+	require.NoError(t, err)
+	assert.NotEqual(t, before, readDigest())
 }
