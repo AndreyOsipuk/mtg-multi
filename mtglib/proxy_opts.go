@@ -299,6 +299,13 @@ type ProxyOpts struct {
 	//
 	// This is an optional setting.
 	APIToken string
+
+	// ServerHelloMSS > 0 sends the FakeTLS ServerHello to the client in
+	// segments with a payload as at MSS = ServerHelloMSS (Linux only); the rest
+	// of the connection uses the regular MSS. 0 disables it.
+	//
+	// This is an optional setting.
+	ServerHelloMSS int
 }
 
 func (p ProxyOpts) valid() error {

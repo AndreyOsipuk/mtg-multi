@@ -370,6 +370,8 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 		doppelGangerURLs[i] = v.String()
 	}
 
+	serverHelloMSS, listenerMSS := clientMSSPlan(conf, logger)
+
 	opts := mtglib.ProxyOpts{
 		Logger:          logger,
 		Network:         ntw,
@@ -411,6 +413,7 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 
 		ThrottleMaxConnections: conf.Throttle.MaxConnections.Get(0),
 		ThrottleCheckInterval:  conf.Throttle.CheckInterval.Get(5 * time.Second),
+		ServerHelloMSS:         serverHelloMSS,
 	}
 
 	proxy, err := mtglib.NewProxy(opts)
@@ -422,7 +425,7 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 	listeners := make([]net.Listener, 0, len(bindAddrs))
 
 	for _, addr := range bindAddrs {
-		l, err := utils.NewListener(addr, 0)
+		l, err := utils.NewListener(addr, 0, listenerMSS)
 		if err != nil {
 			for _, prev := range listeners {
 				prev.Close() //nolint: errcheck
