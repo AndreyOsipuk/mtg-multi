@@ -37,6 +37,14 @@
   const NATIVE_NONCE = (/^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash) || [])[1] || '';
   // Сколько ждём от Telegram первый кадр. Не дождались - мост бесполезен.
   const HELLO_WAIT_MS = 15000;
+  // Самое большое тело /up - в байтах и в кадрах. Не влезшие кадры ждут
+  // следующего запроса. Оба предела в рамках лимитов сервера (MaxBodyBytes,
+  // MaxFramesPerBody), а размер ещё и ниже client_max_body_size nginx по
+  // умолчанию (1m): тело сверх лимита получает 413 или ошибку протокола, а
+  // упавший /up обрывает мост. Один кадр - не больше 64 КБ плюс заголовок,
+  // поэтому всегда влезает.
+  const MAX_UP_BYTES = 512 * 1024;
+  const MAX_UP_FRAMES = 256;
 
   let port = null;
   let closed = false;
@@ -116,18 +124,31 @@
   };
 
   // Кадры от клиента копим и отправляем пачкой: один POST на каждый мелкий
-  // кадр превратил бы обычную переписку в поток запросов.
+  // кадр превратил бы обычную переписку в поток запросов. Пачка берёт кадры
+  // целиком, по порядку, до MAX_UP_BYTES и MAX_UP_FRAMES; остальное уходит
+  // следующим запросом того же цикла (nginx по умолчанию режет тело на 1m).
+  const takeBatch = () => {
+    let count = 0;
+    let total = 0;
+
+    while (count < pending.length && count < MAX_UP_FRAMES) {
+      const size = pending[count].length;
+      if (count > 0 && total + size > MAX_UP_BYTES) break;
+
+      total += size;
+      count++;
+    }
+
+    return { batch: pending.splice(0, count), total };
+  };
+
   const flush = async () => {
     if (flushing || closed || !sessionReady) return;
     flushing = true;
 
     try {
       while (pending.length > 0 && !closed) {
-        const batch = pending;
-        pending = [];
-
-        let total = 0;
-        for (const frame of batch) total += frame.length;
+        const { batch, total } = takeBatch();
 
         const body = new Uint8Array(total);
         let offset = 0;
