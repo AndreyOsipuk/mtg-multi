@@ -19,34 +19,6 @@ import (
 //go:embed bridge/runtime.js
 var bridgeRuntime string
 
-// servedRuntime - скрипт в том виде, в каком он уходит в страницу. Заголовок
-// с лицензией остаётся в исходнике и в бинаре, но из страницы, отдаваемой
-// клиенту, вырезается: копирайт чужого проекта в ответе - лишний признак того,
-// кто его отдаёт.
-var servedRuntime = stripLeadingComment(bridgeRuntime)
-
-// stripLeadingComment вырезает первый блок строк "//" в самом начале скрипта
-// вместе с пустыми строками после него. Больше ничего не трогает: остальные
-// комментарии и весь код остаются как есть.
-func stripLeadingComment(script string) string {
-	rest := script
-
-	for strings.HasPrefix(rest, "//") {
-		end := strings.IndexByte(rest, '\n')
-		if end == -1 {
-			return ""
-		}
-
-		rest = rest[end+1:]
-	}
-
-	if len(rest) == len(script) {
-		return script
-	}
-
-	return strings.TrimLeft(rest, "\r\n")
-}
-
 // bridgeDocument - страница, которую Telegram открывает в вебвью. Ничего
 // лишнего: заголовок нейтральный, весь смысл в скрипте.
 const bridgeDocument = `<!doctype html>
@@ -112,7 +84,7 @@ func (b DefaultBridge) Render(host, bootstrapToken string) (string, string) {
 		report = diagReport
 	}
 
-	runtime := strings.ReplaceAll(servedRuntime, "__REPORT__", report)
+	runtime := strings.ReplaceAll(bridgeRuntime, "__REPORT__", report)
 	runtime = strings.ReplaceAll(runtime, "__TOKEN__", bootstrapToken)
 
 	body := strings.ReplaceAll(bridgeDocument, "__RUNTIME__", runtime)

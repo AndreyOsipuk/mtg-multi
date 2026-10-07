@@ -57,22 +57,33 @@ func TestDefaultBridgeDiag(t *testing.T) {
 	assert.NotContains(t, on, "__REPORT__")
 }
 
-// Заголовок с лицензией адаптированного скрипта остаётся в исходнике, но в
-// странице, отдаваемой клиенту, нет ни его, ни имени проекта.
-func TestDefaultBridgeStripsLicenceHeader(t *testing.T) {
+// The script is adapted from telemt, and the page sent to the client is a
+// copy of it: it must carry the same notice as web/bridge/runtime.js, that is
+// the copyright, the licence, the note that this is a modified version and
+// the list of changes.
+func TestDefaultBridgeKeepsLicenceHeader(t *testing.T) {
 	source, err := os.ReadFile(filepath.Join("bridge", "runtime.js"))
 	require.NoError(t, err)
-	require.Contains(t, string(source), "Portions of this file are adapted from telemt")
+
+	var header []string
+
+	for line := range strings.Lines(string(source)) {
+		if !strings.HasPrefix(line, "//") {
+			break
+		}
+
+		header = append(header, line)
+	}
+
+	notice := strings.Join(header, "")
+	require.Contains(t, notice, "Copyright (c) 2026 Telemt")
+	require.Contains(t, notice, "TELEMT LICENSE 3.3")
+	require.Contains(t, notice, "This is a modified version, not official Telemt.")
+	require.Contains(t, notice, "Changes:")
 
 	for _, diag := range []bool{false, true} {
 		body, _ := web.DefaultBridge{Diag: diag}.Render("proxy.example.com", "TOKEN-VALUE")
 
-		assert.NotContains(t, strings.ToLower(body), "telemt")
-		assert.NotContains(t, body, "Portions of this file")
-		assert.NotContains(t, body, "LICENSE")
-		// The code itself is intact.
-		assert.Contains(t, body, "'use strict';")
-		assert.Contains(t, body, "tproxy-init")
-		assert.Contains(t, body, "})();")
+		assert.Contains(t, body, notice, "diag=%v", diag)
 	}
 }
