@@ -83,7 +83,8 @@ type tomlConfig struct {
 		CheckInterval  string `toml:"check-interval" json:"checkInterval,omitempty"`
 	} `toml:"throttle" json:"throttle,omitempty"`
 	Secured struct {
-		Enabled bool `toml:"enabled" json:"enabled,omitempty"`
+		Enabled      bool   `toml:"enabled" json:"enabled,omitempty"`
+		FrameTimeout string `toml:"frame-timeout" json:"frameTimeout,omitempty"`
 	} `toml:"secured" json:"secured,omitempty"`
 	Stats struct {
 		StatsD struct {

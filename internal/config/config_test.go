@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/dolonet/mtg-multi/internal/config"
 	"github.com/stretchr/testify/suite"
@@ -183,6 +184,7 @@ func (suite *ConfigTestSuite) TestSecuredDisabledByDefault() {
 	conf, err := config.Parse(suite.ReadConfig("minimal.toml"))
 	suite.NoError(err)
 	suite.False(conf.Secured.Enabled.Get(false))
+	suite.EqualValues(0, conf.Secured.FrameTimeout.Get(0))
 }
 
 func (suite *ConfigTestSuite) TestSecured() {
@@ -190,6 +192,7 @@ func (suite *ConfigTestSuite) TestSecured() {
 	suite.NoError(err)
 	suite.NoError(conf.Validate())
 	suite.True(conf.Secured.Enabled.Get(false))
+	suite.Equal(1500*time.Millisecond, conf.Secured.FrameTimeout.Get(0))
 }
 
 func TestConfig(t *testing.T) {
