@@ -1,0 +1,251 @@
+package mtglib
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func newUpdateTestProxy(secrets map[string]Secret) *Proxy {
+	p := &Proxy{
+		stats:    NewProxyStats(),
+		sessions: newSessionRegistry(),
+	}
+	set := newSecretSet(secrets)
+
+	for _, name := range set.names {
+		p.stats.PreRegister(name)
+	}
+
+	p.secretSet.Store(set)
+
+	return p
+}
+
+// authenticatedSession imitates a stream that has passed the handshake with
+// the given secret and registers it like ServeConn does.
+func authenticatedSession(t *testing.T, p *Proxy, name string, secret Secret) *streamContext {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stream := &streamContext{
+		ctx:              ctx,
+		ctxCancel:        cancel,
+		secretName:       name,
+		matchedSecretKey: secret.Key[:],
+	}
+
+	require.True(t, p.trackSession(stream))
+
+	return stream
+}
+
+func isClosed(stream *streamContext) bool {
+	select {
+	case <-stream.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func TestNewSecretSet(t *testing.T) {
+	t.Parallel()
+
+	a := GenerateSecret("a.example.com")
+	b := GenerateSecret("b.example.com")
+	c := GenerateSecret("a.example.com")
+
+	set := newSecretSet(map[string]Secret{"carol": c, "alice": a, "bob": b})
+
+	assert.Equal(t, []string{"alice", "bob", "carol"}, set.names)
+	assert.Equal(t, []Secret{a, b, c}, set.secrets)
+	assert.Equal(t, [][]byte{a.Key[:], b.Key[:], c.Key[:]}, set.keys)
+	assert.Equal(t, []string{"a.example.com", "b.example.com"}, set.hostnames)
+	assert.True(t, set.sameSecret("bob", b.Key[:]))
+	assert.False(t, set.sameSecret("bob", a.Key[:]))
+	assert.False(t, set.sameSecret("dave", a.Key[:]))
+}
+
+func TestUpdateSecretsRejectsInvalidSet(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice})
+	stream := authenticatedSession(t, p, "alice", alice)
+
+	_, err := p.UpdateSecrets(map[string]Secret{})
+	require.ErrorIs(t, err, ErrSecretEmpty)
+
+	_, err = p.UpdateSecrets(map[string]Secret{"bob": {}})
+	require.Error(t, err)
+
+	// A failed update leaves everything as it was.
+	assert.Equal(t, []string{"alice"}, p.secretSet.Load().names)
+	assert.False(t, isClosed(stream))
+}
+
+func TestUpdateSecretsKeepsUnchangedSessions(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("example.com")
+	bob := GenerateSecret("example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice, "bob": bob})
+
+	aliceSession := authenticatedSession(t, p, "alice", alice)
+	bobSession := authenticatedSession(t, p, "bob", bob)
+
+	carol := GenerateSecret("other.example.com")
+	update, err := p.UpdateSecrets(map[string]Secret{"alice": alice, "bob": bob, "carol": carol})
+	require.NoError(t, err)
+
+	assert.Equal(t, SecretsUpdate{Added: 1}, update)
+	assert.False(t, isClosed(aliceSession))
+	assert.False(t, isClosed(bobSession))
+
+	set := p.secretSet.Load()
+	assert.Equal(t, []string{"alice", "bob", "carol"}, set.names)
+	assert.Equal(t, []string{"example.com", "other.example.com"}, set.hostnames)
+	assert.NotNil(t, p.stats.lookup("carol"))
+}
+
+func TestUpdateSecretsClosesRemovedAndChanged(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("example.com")
+	bob := GenerateSecret("example.com")
+	carol := GenerateSecret("example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice, "bob": bob, "carol": carol})
+
+	alice1 := authenticatedSession(t, p, "alice", alice)
+	alice2 := authenticatedSession(t, p, "alice", alice)
+	bobSession := authenticatedSession(t, p, "bob", bob)
+	carolSession := authenticatedSession(t, p, "carol", carol)
+
+	// alice is removed, bob gets a new key, carol is kept.
+	bobRotated := GenerateSecret("example.com")
+	update, err := p.UpdateSecrets(map[string]Secret{"bob": bobRotated, "carol": carol})
+	require.NoError(t, err)
+
+	assert.Equal(t, SecretsUpdate{Removed: 1, Changed: 1, ClosedSessions: 3}, update)
+	assert.True(t, isClosed(alice1))
+	assert.True(t, isClosed(alice2))
+	assert.True(t, isClosed(bobSession))
+	assert.False(t, isClosed(carolSession))
+
+	// The removed user disappears from the stats, and late updates from its
+	// closing sessions do not bring it back.
+	assert.Nil(t, p.stats.lookup("alice"))
+	p.stats.OnDisconnect("alice")
+	p.stats.AddBytesIn("alice", 10)
+	p.stats.AddBytesOut("alice", 10)
+	p.stats.UpdateLastSeen("alice")
+	assert.Nil(t, p.stats.lookup("alice"))
+
+	// The kept user still has its stats.
+	assert.EqualValues(t, 1, p.stats.lookup("carol").connections.Load())
+
+	// Closed sessions unregister themselves as ServeConn does on return.
+	p.sessions.remove(alice1)
+	p.sessions.remove(alice2)
+	p.sessions.remove(bobSession)
+	assert.Len(t, p.sessions.sessions, 1)
+}
+
+func TestUpdateSecretsHostChangeClosesSessions(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("old.example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice})
+	stream := authenticatedSession(t, p, "alice", alice)
+
+	moved := alice
+	moved.Host = "new.example.com"
+
+	update, err := p.UpdateSecrets(map[string]Secret{"alice": moved})
+	require.NoError(t, err)
+
+	assert.Equal(t, SecretsUpdate{Changed: 1, ClosedSessions: 1}, update)
+	assert.True(t, isClosed(stream))
+	assert.Equal(t, []string{"new.example.com"}, p.secretSet.Load().hostnames)
+}
+
+// A handshake that matched a secret before an update must not register a
+// session after the update has removed or rotated that secret: the session
+// would escape the sweep.
+func TestTrackSessionAfterSecretRemoved(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("example.com")
+	bob := GenerateSecret("example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice, "bob": bob})
+
+	_, err := p.UpdateSecrets(map[string]Secret{"bob": GenerateSecret("example.com")})
+	require.NoError(t, err)
+
+	for name, secret := range map[string]Secret{"alice": alice, "bob": bob} {
+		ctx, cancel := context.WithCancel(context.Background())
+		stream := &streamContext{
+			ctx:              ctx,
+			ctxCancel:        cancel,
+			secretName:       name,
+			matchedSecretKey: secret.Key[:],
+		}
+
+		assert.False(t, p.trackSession(stream), name)
+		cancel()
+	}
+
+	assert.Empty(t, p.sessions.sessions)
+	// A rejected session is not counted, and the removed user is not
+	// brought back into the stats.
+	assert.Nil(t, p.stats.lookup("alice"))
+	assert.Zero(t, p.stats.lookup("bob").connections.Load())
+}
+
+func TestUpdateSecretsConcurrentWithSessions(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("example.com")
+	p := newUpdateTestProxy(map[string]Secret{"alice": alice})
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for range 1000 {
+			ctx, cancel := context.WithCancel(context.Background())
+			stream := &streamContext{
+				ctx:              ctx,
+				ctxCancel:        cancel,
+				secretName:       "alice",
+				matchedSecretKey: alice.Key[:],
+			}
+
+			if p.trackSession(stream) {
+				p.sessions.remove(stream)
+			}
+
+			cancel()
+		}
+	}()
+
+	for i := range 200 {
+		secrets := map[string]Secret{"alice": alice}
+		if i%2 == 0 {
+			secrets["bob"] = GenerateSecret("example.com")
+		}
+
+		_, err := p.UpdateSecrets(secrets)
+		require.NoError(t, err)
+	}
+
+	<-done
+
+	assert.Empty(t, p.sessions.sessions)
+}

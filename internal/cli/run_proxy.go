@@ -256,7 +256,10 @@ func warnDeprecatedDomainFronting(conf *config.Config, log mtglib.Logger) {
 	}
 }
 
-func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyclop
+// runProxy runs the proxy until SIGINT/SIGTERM. If readConfig is not nil,
+// SIGHUP re-reads the configuration and applies its secrets without a
+// restart.
+func runProxy(conf *config.Config, version string, readConfig func() (*config.Config, error)) error { //nolint: funlen, cyclop
 	logger := makeLogger(conf)
 
 	logger.BindJSON("configuration", conf.String()).Debug("configuration")
@@ -391,6 +394,10 @@ func runProxy(conf *config.Config, version string) error { //nolint: funlen, cyc
 
 		cancel()
 	}()
+
+	if readConfig != nil {
+		go watchReload(ctx, utils.ReloadSignals(), readConfig, proxy, logger.Named("reload"))
+	}
 
 	return waitAndShutdown(ctx, serveErr, func() {
 		listener.Close() //nolint: errcheck
