@@ -212,6 +212,54 @@ func TestServerEndToEnd(t *testing.T) {
 	assert.Equal(t, []byte("pong"), frames[0].Payload)
 }
 
+// Сервер принимает самую большую пачку /up, которую шлёт страница (целые кадры
+// до 512 КБ, не больше 256 кадров), и тело ровно в MaxBodyBytes, а больше - нет.
+func TestServerAcceptsUpBodyUpToMaxBodyBytes(t *testing.T) {
+	discard := func(stream *web.Stream) {
+		io.Copy(io.Discard, stream) //nolint: errcheck
+	}
+
+	upOK := func(t *testing.T, srv *web.Server, token string, body []byte) {
+		t.Helper()
+
+		rec := do(srv, carrierRequest("/api/v1/up", token, body))
+		require.Equal(t, "application/octet-stream", rec.Header().Get("Content-Type"))
+		require.Equal(t, 1, srv.SessionCount())
+	}
+
+	full := web.Encode(web.FrameData, 1, make([]byte, web.DataChunkBytes))
+
+	t.Run("largest page batches with the defaults", func(t *testing.T) {
+		srv, profile := newTestServer(t, discard)
+		token := openSession(t, srv, profile)
+
+		upOK(t, srv, token, web.Encode(web.FrameOpen, 1, nil))
+		upOK(t, srv, token, bytes.Repeat(full, 512*1024/len(full)))
+
+		many := web.Encode(web.FrameOpen, 3, nil)
+		for range web.DefaultLimits().MaxFramesPerBody - 1 {
+			many = append(many, web.Encode(web.FrameData, 3, []byte{1})...)
+		}
+
+		upOK(t, srv, token, many)
+	})
+
+	t.Run("exactly the limit and one frame over it", func(t *testing.T) {
+		small := web.Encode(web.FrameData, 1, []byte("data"))
+
+		srv, profile := newTestServer(t, discard, func(cfg *web.ServerConfig) {
+			cfg.MaxBodyBytes = int64(3 * len(small))
+		})
+		token := openSession(t, srv, profile)
+
+		upOK(t, srv, token, web.Encode(web.FrameOpen, 1, nil))
+		upOK(t, srv, token, bytes.Repeat(small, 3))
+
+		rec := do(srv, carrierRequest("/api/v1/up", token, bytes.Repeat(small, 4)))
+		assert.Equal(t, decoyBody, rec.Body.String())
+	})
+}
+
 // Клиентский IP берётся из X-Forwarded-For только от доверенного прокси - это
 // nginx на localhost. Иначе любой мог бы назначить себе чужой адрес и обойти
 // ограничения по адресам.
