@@ -48,6 +48,7 @@ for the shared internals.
   - [Environment variables](#environment-variables)
   - [Secured (dd) handshakes](#secured-dd-handshakes)
   - [Warm Telegram DC pool](#warm-telegram-dc-pool)
+  - [Small-segment ServerHello (client MSS)](#small-segment-serverhello-client-mss)
   - [Config overlay](#config-overlay)
 - [Running under 3X-UI](#running-under-3x-ui)
 - [Command reference](#command-reference)
@@ -456,6 +457,36 @@ dcs = [2, -2, 203, 4, -4]  # MTG_DC_POOL_DCS="2,-2,203"; negative ids are media 
 
 For `[secured]` and `[dc-pool]` a key in the config wins over the environment
 variable, and the variable wins over the default.
+
+### Small-segment ServerHello (client MSS)
+
+Some DPI boxes recognise the FakeTLS ServerHello when it arrives in full-size
+TCP segments, but not when it is split into small ones. On Linux mtg-multi can
+send only the ServerHello in small segments and keep full-size segments for
+the rest of the session:
+
+```toml
+[network]
+client-mss = 92         # MSS used for the ServerHello; 0 (default) disables
+client-mss-bulk = 1400  # MSS for the rest of the session (default 1400)
+```
+
+- `client-mss` is `0` or `48..1460`; `client-mss-bulk` is `0` or
+  `536..65495` and must be greater than `client-mss`.
+- With `client-mss-bulk > 0` the listening socket gets `TCP_MAXSEG =
+  client-mss-bulk`, and the ServerHello is written in chunks that fit one
+  segment at `client-mss` (minus TCP options), each chunk only after the
+  previous one has left the socket queue, so the kernel cannot merge them.
+  With `client-mss = 92` and TCP timestamps that is 80 bytes per segment.
+- `client-mss-bulk = 0` puts `TCP_MAXSEG = client-mss` on the listening
+  socket for the whole session (like `iptables TCPMSS --set-mss` on the client
+  SYN); `client-mss` must then be at least 88 (kernel minimum).
+- Linux does not raise the segment size of an established connection with
+  `setsockopt(TCP_MAXSEG)`: the size is fixed during the handshake. That is why
+  the bulk MSS goes on the listener and only the ServerHello is split.
+- Secured (`dd`) handshakes have no server response; see `[secured] shape`.
+- The listener options are read at start; changing them needs a restart. The
+  keys work from `MTG_CONFIG_OVERLAY` too. Ignored outside Linux.
 
 ### Config overlay
 

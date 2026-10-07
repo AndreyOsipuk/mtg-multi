@@ -92,6 +92,11 @@ type Config struct {
 		DNS             TypeDNSURI     `json:"dns"`
 		Proxies         []TypeProxyURL `json:"proxies"`
 		TCPNotSentLowat TypeBytes      `json:"tcpNotSentLowat"`
+		// ClientMSS - MSS, которым дробится ServerHello FakeTLS (0 - выкл).
+		ClientMSS TypeTCPMSS `json:"clientMss"`
+		// ClientMSSBulk - MSS остальной сессии; nil - ключа нет (умолчание),
+		// явный 0 - вся сессия на ClientMSS.
+		ClientMSSBulk *TypeTCPMSS `json:"clientMssBulk"`
 	} `json:"network"`
 	APIBindTo TypeHostPort `json:"apiBindTo"`
 	// Secured controls secured (dd) handshakes and shaping of the first
@@ -201,7 +206,71 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	return c.validateClientMSS()
+}
+
+// Границы client-mss и client-mss-bulk. client-mss до 1460 (MSS Ethernet);
+// ServerHello дробится в пространстве пользователя, поэтому годится и меньше
+// минимума ядра. Но если client-mss-bulk = 0, client-mss ставится прямо на
+// сокет, а ядро не принимает TCP_MAXSEG меньше TCP_MIN_MSS (88). bulk не
+// меньше классических 536 и не больше предела ядра (MAX_TCP_WINDOW).
+const (
+	ClientMSSMin       = 48
+	ClientMSSMax       = 1460
+	ClientMSSKernelMin = 88
+	ClientMSSBulkMin   = 536
+	ClientMSSBulkMax   = 65495
+
+	// DefaultClientMSSBulk - MSS сессии после ServerHello, если
+	// client-mss задан, а client-mss-bulk нет.
+	DefaultClientMSSBulk = 1400
+)
+
+func (c *Config) validateClientMSS() error {
+	mss := c.Network.ClientMSS.Get(0)
+	if mss != 0 && (mss < ClientMSSMin || mss > ClientMSSMax) {
+		return fmt.Errorf("network.client-mss must be 0 or %d..%d, got %d",
+			ClientMSSMin, ClientMSSMax, mss)
+	}
+
+	if c.Network.ClientMSSBulk == nil {
+		return nil
+	}
+
+	bulk := c.Network.ClientMSSBulk.Get(0)
+	if bulk != 0 && (bulk < ClientMSSBulkMin || bulk > ClientMSSBulkMax) {
+		return fmt.Errorf("network.client-mss-bulk must be 0 or %d..%d, got %d",
+			ClientMSSBulkMin, ClientMSSBulkMax, bulk)
+	}
+
+	if mss != 0 && bulk == 0 && mss < ClientMSSKernelMin {
+		return fmt.Errorf("network.client-mss must be at least %d when network.client-mss-bulk = 0, got %d",
+			ClientMSSKernelMin, mss)
+	}
+
+	if mss != 0 && bulk != 0 && bulk <= mss {
+		return fmt.Errorf("network.client-mss-bulk (%d) must be greater than network.client-mss (%d)",
+			bulk, mss)
+	}
+
 	return nil
+}
+
+// GetClientMSS возвращает MSS для ServerHello и MSS остальной сессии.
+// client-mss = 0 - всё выключено (0, 0), client-mss-bulk без client-mss
+// ни на что не влияет. bulk = 0 - вся сессия идёт на client-mss, как с
+// iptables TCPMSS на SYN клиента.
+func (c *Config) GetClientMSS() (handshake, bulk uint) {
+	handshake = c.Network.ClientMSS.Get(0)
+	if handshake == 0 {
+		return 0, 0
+	}
+
+	if c.Network.ClientMSSBulk == nil {
+		return handshake, DefaultClientMSSBulk
+	}
+
+	return handshake, c.Network.ClientMSSBulk.Get(0)
 }
 
 // validateAdTags ensures every [secret-ad-tags] entry names a secret that
