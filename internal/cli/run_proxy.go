@@ -418,8 +418,15 @@ func runProxy(
 	}()
 
 	if readConfig != nil {
+		// A SIGHUP reloads the users of the WEB mode as well; the rest of
+		// the [web] section is read only at startup.
+		var updater secretsUpdater = proxy
+		if webServer != nil {
+			updater = reloadWithWeb{proxy: proxy, web: webServer, logger: logger.Named("reload")}
+		}
+
 		go watchReload(
-			ctx, reloadSignals, readConfig, proxy,
+			ctx, reloadSignals, readConfig, updater,
 			net.DefaultResolver, conf.GetSecrets(), logger.Named("reload"),
 		)
 	}
@@ -491,12 +498,7 @@ func startWeb(conf *config.Config, proxy *mtglib.Proxy, logger mtglib.Logger) (*
 		return nil, nil, nil
 	}
 
-	secrets := make(map[string][]byte, len(conf.GetSecrets()))
-	for name, secret := range conf.GetSecrets() {
-		key := make([]byte, len(secret.Key))
-		copy(key, secret.Key[:])
-		secrets[name] = key
-	}
+	secrets := webSecrets(conf.GetSecrets())
 
 	mode := web.SecretModeDD
 	if strings.EqualFold(strings.TrimSpace(conf.Web.SecretMode), string(web.SecretModePlain)) {

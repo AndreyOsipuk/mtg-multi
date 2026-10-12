@@ -105,7 +105,7 @@ func Setup(settings Settings, secrets map[string][]byte, handle func(*Stream)) (
 	}
 
 	cfg := DefaultServerConfig()
-	cfg.VHosts = []VHost{{Host: host, Profiles: table, Decoy: decoy}}
+	cfg.VHosts = []VHost{{Host: host, Profiles: table, Decoy: decoy, SecretMode: mode}}
 	cfg.Bridge = DefaultBridge{Diag: settings.Diag && settings.Logger != nil}
 	cfg.Handle = handle
 	cfg.Logger = settings.Logger

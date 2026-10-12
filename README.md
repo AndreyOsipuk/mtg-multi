@@ -136,6 +136,7 @@ Notes:
 - The capability in `/?bridge=...` works like a password for the WEB link of that user. Keep it out of logs (`log_format` above) and out of `Referer`.
 - Set `client_max_body_size` at least to mtg's limit on one `/up` body (32 MB), as in the example. The bridge page itself sends at most 512 KB per request, so it also fits nginx's default of 1m, but a proxy limit below that answers 413, and the page treats a failed upload as the end of the session.
 - One user cannot take the whole server: by default a user has at most 4 live sessions and 8 bridge tokens not used yet (`max-sessions-per-user`, `max-pending-per-user`); past that, the user's oldest one gives way.
+- `SIGHUP` reloads the WEB users together with the proxy ones: they are the same `[secrets]`. A new user's WEB link works right away. WEB sessions of a removed user, or of a user whose secret has changed, are closed together with their streams, their unused bridge tokens are dropped, and their old link gets the decoy. Sessions of unchanged users go on. The `[web]` section itself (`bind-to`, `host`, `secret-mode`, `decoy-dir`, the limits, `diag`) is read only at startup: changing it needs a restart.
 
 Everything else — domain fronting, doppelganger, proxy chaining, blocklists, metrics — works exactly as in upstream. See the [upstream README](https://github.com/9seconds/mtg) for details.
 
@@ -278,6 +279,7 @@ decoy-dir = "/var/www/decoy"
 - Capability в `/?bridge=...` - это пароль WEB-ссылки пользователя. Не пишите её в access_log (`log_format` без query string, как в примере) и включите `server_tokens off`.
 - `client_max_body_size` - не ниже лимита mtg на одно тело `/up` (32 МБ), как в примере. Сама страница-мост отправляет не больше 512 КБ за запрос и укладывается и в дефолтный 1m nginx, но лимит прокси ниже этого даёт 413, а неудачная отправка для страницы - конец сессии.
 - Один пользователь не займёт весь сервер: по умолчанию у него не больше 4 живых сессий и 8 неиспользованных токенов моста (`max-sessions-per-user`, `max-pending-per-user`), сверх этого вытесняются его же самые старые.
+- `SIGHUP` перечитывает WEB-пользователей вместе с обычными: это тот же `[secrets]`. WEB-ссылка нового пользователя работает сразу. WEB-сессии удалённого пользователя и пользователя со сменённым секретом закрываются вместе с их потоками, его неиспользованные токены моста сбрасываются, а старая ссылка получает заглушку. Сессии неизменённых пользователей продолжаются. Сам раздел `[web]` (`bind-to`, `host`, `secret-mode`, `decoy-dir`, лимиты, `diag`) читается только при старте: для его изменения нужен рестарт.
 
 Всё остальное — domain fronting, doppelganger, цепочки прокси, блоклисты, метрики — работает как в оригинале. Подробности в [README upstream](https://github.com/9seconds/mtg).
 
