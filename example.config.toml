@@ -521,6 +521,10 @@ dcs = [1, 2, 3, 4, 5]
 # Streams inside WEB use the secured (obfuscated2) handshake. It is accepted for
 # WEB streams only and does not make the FakeTLS listener accept dd clients.
 [web]
+# WEB users are the [secrets] users: SIGHUP reloads them here as well,
+# closing the WEB sessions of removed and changed users. The options of this
+# section are read only at startup.
+#
 # Empty (default) disables the WEB mode. Must be a loopback address.
 bind-to = ""
 # Domain from the tg://webproxy link, served by the reverse proxy.

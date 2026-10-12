@@ -55,6 +55,9 @@ type VHost struct {
 	Host     string
 	Profiles *ProfileTable
 	Decoy    Decoy
+	// SecretMode is the key form in the links of this domain. UpdateSecrets
+	// rebuilds the user table with it; empty means dd.
+	SecretMode SecretMode
 }
 
 // Logger receives the messages of the WEB frontend. mtglib.Logger satisfies
@@ -144,10 +147,17 @@ const shutdownTimeout = 5 * time.Second
 // greatly reduces the attack surface: certificates are handled by software
 // built for that.
 type Server struct {
-	cfg    ServerConfig
-	vhosts map[string]VHost
+	cfg ServerConfig
 
-	mu       sync.Mutex
+	// vhosts is read on every request and replaced by UpdateSecrets.
+	vhostMu sync.RWMutex
+	vhosts  map[string]VHost
+
+	mu sync.Mutex
+	// current holds every profile of the current user tables. A token or a
+	// session is admitted only for a profile in it: a request that matched
+	// a table just before UpdateSecrets cannot bring a removed user back.
+	current  map[Profile]struct{}
 	sessions map[TokenHash]*Session
 	// pending holds tokens issued by the bridge page for which no session has
 	// been created yet. They belong to the server, not the package: two
@@ -176,6 +186,7 @@ func NewServer(cfg ServerConfig) *Server {
 	srv := &Server{
 		cfg:            cfg,
 		vhosts:         vhosts,
+		current:        profileSet(vhosts),
 		sessions:       make(map[TokenHash]*Session),
 		pending:        make(map[TokenHash]pendingToken),
 		sessionsByUser: make(map[string]int),
@@ -324,7 +335,9 @@ func (s *Server) matchVHost(r *http.Request) (VHost, bool) {
 		host = host[:idx]
 	}
 
+	s.vhostMu.RLock()
 	vhost, ok := s.vhosts[host]
+	s.vhostMu.RUnlock()
 
 	return vhost, ok
 }
@@ -421,6 +434,10 @@ func (s *Server) registerPending(hash TokenHash, profile Profile, ip net.IP) boo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if _, ok := s.current[profile]; !ok {
+		return false
+	}
+
 	if s.cfg.MaxPending > 0 && len(s.pending) >= s.cfg.MaxPending {
 		return false
 	}
@@ -490,6 +507,14 @@ func (s *Server) hasPending(hash TokenHash) bool {
 // A user at their own cap loses the session that has been silent the longest.
 func (s *Server) addSession(hash TokenHash, session *Session) bool {
 	s.mu.Lock()
+
+	// The pending token was dropped if its user went away, but the check
+	// costs nothing and does not depend on that.
+	if _, ok := s.current[session.profile]; !ok {
+		s.mu.Unlock()
+
+		return false
+	}
 
 	if s.cfg.MaxSessions > 0 && len(s.sessions) >= s.cfg.MaxSessions {
 		s.mu.Unlock()
