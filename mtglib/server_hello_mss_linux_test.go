@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
+	"os"
 	"syscall"
 	"testing"
 	"time"
@@ -139,7 +140,7 @@ func TestWriteFragmentedSmallHelloThenBulk(t *testing.T) {
 	chunk := segmentPayload(92, before)
 	assert.LessOrEqual(t, chunk, 80+12)
 
-	n, err := writeFragmented(server, hello, 92, time.Now().Add(5*time.Second))
+	n, err := writeFragmented(server, hello, 92)
 	require.NoError(t, err)
 	assert.Equal(t, len(hello), n)
 
@@ -170,8 +171,8 @@ func TestWriteFragmentedSmallHelloThenBulk(t *testing.T) {
 
 // Chunks must not be merged when sending is window-limited: a client with a
 // tiny receive window does not read for 300 ms, the kernel keeps the data
-// queued. Without waiting for tcpi_notsent_bytes = 0 the next chunks would be
-// appended to the unsent tail of the queue and leave as one large segment.
+// queued. Without MSG_EOR the next chunks would be appended to the unsent tail
+// of the queue and leave as one large segment.
 func TestWriteFragmentedDoesNotCoalesceWhenWindowLimited(t *testing.T) {
 	server, client := mssTestPair(t, 1400, 2048)
 
@@ -192,7 +193,7 @@ func TestWriteFragmentedDoesNotCoalesceWhenWindowLimited(t *testing.T) {
 		got <- buf[:n]
 	}()
 
-	_, err = writeFragmented(server, hello, 92, time.Now().Add(5*time.Second))
+	_, err = writeFragmented(server, hello, 92)
 	require.NoError(t, err)
 
 	assert.Equal(t, hello, <-got)
@@ -215,7 +216,7 @@ func TestSendServerHelloThroughFragmentedWriter(t *testing.T) {
 	require.NoError(t, err)
 
 	secret := GenerateSecret("example.com")
-	writer := fragmentedWriter{conn: server, mss: 92, deadline: time.Now().Add(5 * time.Second)}
+	writer := fragmentedWriter{conn: server, mss: 92}
 
 	before := waitAllAcked(t, server)
 
@@ -275,7 +276,7 @@ func TestWriteFragmentedFallsBackForNonTCP(t *testing.T) {
 
 	got := readAllAsync(right, 3)
 
-	n, err := writeFragmented(left, []byte("abc"), 92, time.Time{})
+	n, err := writeFragmented(left, []byte("abc"), 92)
 	require.NoError(t, err)
 	assert.Equal(t, 3, n)
 	assert.Equal(t, []byte("abc"), <-got)
@@ -299,4 +300,74 @@ func getsockoptMSS(conn *net.TCPConn) (int, error) {
 	}
 
 	return mss, sysErr //nolint: wrapcheck
+}
+
+func setSndBuf(t *testing.T, conn *net.TCPConn, size int) {
+	t.Helper()
+
+	rawConn, err := conn.SyscallConn()
+	require.NoError(t, err)
+
+	var opErr error
+
+	require.NoError(t, rawConn.Control(func(fd uintptr) {
+		opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, size)
+	}))
+	require.NoError(t, opErr)
+}
+
+// A full send buffer: the client does not read for a while, the server's send
+// buffer is small, so sendmsg returns EAGAIN and partial sends in the middle
+// of a chunk. The write waits for the socket to become writable, the data
+// arrives intact, and every chunk still leaves in its own segment: the rest
+// of a partially sent chunk joins it, not the next chunk.
+func TestWriteFragmentedSendBufferFull(t *testing.T) {
+	server, client := mssTestPair(t, 1400, 2048)
+	setSndBuf(t, server, 4096)
+
+	hello := make([]byte, 16*1024)
+	_, err := rand.Read(hello)
+	require.NoError(t, err)
+
+	before := waitAllAcked(t, server)
+	chunk := segmentPayload(92, before)
+
+	got := make(chan []byte, 1)
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+
+		buf := make([]byte, len(hello))
+		n, _ := io.ReadFull(client, buf)
+		got <- buf[:n]
+	}()
+
+	require.NoError(t, server.SetWriteDeadline(time.Now().Add(5*time.Second)))
+
+	n, err := writeFragmented(server, hello, 92)
+	require.NoError(t, err)
+	assert.Equal(t, len(hello), n)
+	assert.Equal(t, hello, <-got)
+
+	after := waitAllAcked(t, server)
+	segs := int(after.Segs_out - before.Segs_out)
+	wantSegs := (len(hello) + chunk - 1) / chunk
+
+	assert.GreaterOrEqual(t, segs, wantSegs)
+	t.Logf("send buffer 4 KB, receive window 2 KB: %d bytes left in %d segments (%d chunks)", len(hello), segs, wantSegs)
+}
+
+// A client that never reads cannot hold the write past the write deadline of
+// the connection (the handshake deadline in the proxy).
+func TestWriteFragmentedHonoursWriteDeadline(t *testing.T) {
+	server, _ := mssTestPair(t, 1400, 2048)
+	setSndBuf(t, server, 4096)
+
+	require.NoError(t, server.SetWriteDeadline(time.Now().Add(300*time.Millisecond)))
+
+	started := time.Now()
+	_, err := writeFragmented(server, make([]byte, 1<<20), 92)
+
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	assert.Less(t, time.Since(started), 3*time.Second)
 }

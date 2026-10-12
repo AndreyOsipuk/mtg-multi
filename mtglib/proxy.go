@@ -375,11 +375,7 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	// segments; the rest of the session is not affected.
 	var helloWriter io.Writer = ctx.clientConn
 	if p.serverHelloMSS > 0 {
-		helloWriter = fragmentedWriter{
-			conn:     ctx.clientConn,
-			mss:      p.serverHelloMSS,
-			deadline: ctx.handshakeDeadline,
-		}
+		helloWriter = fragmentedWriter{conn: ctx.clientConn, mss: p.serverHelloMSS}
 	}
 
 	if err := fake.SendServerHello(helloWriter, matchedSecret.Key[:], result.Hello, noiseParams); err != nil {
