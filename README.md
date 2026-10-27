@@ -96,16 +96,16 @@ decoy-dir = "/var/www/decoy"
 ```
 
 ```nginx
+# In the http context, outside the server block. The bridge link carries the
+# user's capability in the query string, so log without it.
+log_format no_query '$remote_addr [$time_local] "$request_method $uri" $status';
+
 server {
     listen 443 ssl http2;
     server_name proxy.example.com;
     ssl_certificate     /etc/letsencrypt/live/proxy.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/proxy.example.com/privkey.pem;
 
-    # The bridge link carries the user's capability in the query string, and
-    # the default access log would store it. Log without the query string, or
-    # turn the log off for this server.
-    log_format no_query '$remote_addr [$time_local] "$request_method $uri" $status';
     access_log /var/log/nginx/proxy.access.log no_query;
 
     # The decoy error pages say "nginx" without a version.
